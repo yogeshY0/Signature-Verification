@@ -10,7 +10,7 @@ This document outlines the architecture and implementation steps for an offline 
 The architecture has four main stages:
 
 1. **Extraction (YOLO):** Locate and crop the signature. *Implemented upstream.*
-2. **Preprocessing:** (2.1) Reduce banking artifacts such as stamps, lines, and noise (*implemented upstream*), then (2.2) convert the signature image to black and white and resize it to the agreed wide aspect ratio (*implemented in [signature_preprocessing.py](./signature_preprocessing.py)*).
+2. **Preprocessing:** (2.1) Reduce banking artifacts such as stamps, lines, and noise (*implemented upstream*), then (2.2) normalize the signature to grayscale and resize it to the agreed wide aspect ratio (*implemented in [signature_preprocessing.py](./signature_preprocessing.py)*).
 3. **Feature extraction (ConvNeXt Siamese):** Convert the preprocessed image into a dense vector.
 4. **Scoring engine:** Calculate a similarity score for the pair.
 
@@ -48,7 +48,7 @@ Stage 2 has two steps:
 | Step | Responsibility | Status |
 | --- | --- | --- |
 | 2.1 Artifact cleaning | Remove stamps, printed lines, and noise from the YOLO crop. | Done upstream (outside this repository) |
-| 2.2 Black-and-white conversion and aspect-aware resize | Turn the cleaned signature image into a binary, fixed-size, wide-aspect model input. | **Implemented** in [signature_preprocessing.py](./signature_preprocessing.py) |
+| 2.2 Grayscale normalization and aspect-aware resize | Preserve stroke intensity, normalize polarity, and create a fixed-size, wide-aspect model input. | **Implemented** in [signature_preprocessing.py](./signature_preprocessing.py) |
 
 Gate crops with low YOLO confidence or multiple detections before Stage 2. Empty images (no ink) are rejected in step 2.2 with a `ValueError`, so they can be routed to review instead of being scored.
 
@@ -56,15 +56,17 @@ Gate crops with low YOLO confidence or multiple detections before Stage 2. Empty
 
 This system only relies on the following contract for the upstream output:
 
-- A single signature image as a `uint8` array (grayscale `H × W`, or 3-channel BGR). Any size, aspect ratio, and ink polarity is accepted by step 2.2.
-- **Current output:** a binarized image with **white ink (255) on a black background (0)**, on a square canvas (observed: 512 × 512) in which the signature fills only a part of the area (observed: about 427 × 188 px, roughly 3% ink pixels). Ink strokes are about 1–2 px wide.
+- A single signature image as a `uint8` array (grayscale `H × W`, or 3-channel BGR). Any size and aspect ratio is accepted by step 2.2, with dark ink on a white or whitish background.
+- **Current output:** a grayscale image with dark ink on a white or whitish background, on a square canvas (observed: 512 × 512) in which the signature fills only a part of the area (observed: about 427 × 188 px). Ink strokes are about 1–2 px wide.
 
 **Upstream check:** In the sample output the lower ends of several strokes end on a flat horizontal edge at the bottom of the ink area, which suggests the signature may be clipped by the YOLO box. Verify this on more samples and add margin to the detection box if confirmed, because clipped strokes cannot be recovered downstream.
 
-#### Step 2.2: Black-and-white conversion and aspect-aware resize (implemented)
+#### Step 2.2: Grayscale normalization and aspect-aware resize (implemented)
 
-**Input:** the signature image from step 2.1 (any size, grayscale or BGR, either ink polarity).  
-**Output:** a `192 × 384` (H × W) `uint8` image with **black ink (0) on a white background (255)**, ready for Stage 3.
+**Input:** the signature image from step 2.1 (any size, grayscale or BGR, dark ink on a white or whitish background).
+**Output:** a `192 × 384` (H × W) `uint8` grayscale image with dark ink on a
+white background, ready for Stage 3. Grayscale values are retained so the model
+can use pressure and ink-flow information.
 
 Signatures are wide, so a square canvas wastes most of the input area and forces heavy downscaling of thin strokes. The agreed input is a **wide-aspect, higher-resolution canvas**:
 
@@ -76,10 +78,10 @@ Signatures are wide, so a square canvas wastes most of the input area and forces
 
 Procedure (`preprocess_signature`):
 
-1. **Black-and-white conversion** (`to_black_and_white`): convert to grayscale, then binarize with Otsu's method. The result is normalized to black ink on white.
-   - `ink="light"` is the current upstream output (white ink on black) and is inverted. `ink="dark"` leaves the polarity unchanged.
-   - `ink="auto"` (default) treats the minority class as ink, because a signature covers far less than half of its crop. Use an explicit value in production.
-   - An optional Gaussian blur (`blur_ksize`, disabled by default) suppresses scanner noise before thresholding. Leave it off for already-clean binary input, where it would only soften 1–2 px strokes.
+1. **Grayscale normalization** (`to_grayscale`): convert to grayscale and normalize polarity to dark ink on white without thresholding.
+   - The pipeline assumes dark ink on a white or whitish background. The legacy `ink` argument is retained for caller compatibility but is not inspected or used to invert the image.
+   - Background pixels are corrected to exactly 255; grayscale values inside the signature are preserved.
+   - Illumination flattening and optional Gaussian blur operate on grayscale values; blur is disabled by default to retain pressure detail.
 2. **Crop tightly to the ink** (`crop_to_ink`): bounding box of the ink plus a 5% margin. This is required: in the sample output the signature occupies only about 427 × 188 px of a 512 × 512 canvas, so resizing the whole square would shrink it to about 160 × 70 px with 1 px strokes. Tight cropping gives about 350 × 154 px, roughly 5× more ink pixels, on the same canvas.
 3. **Aspect-aware resize** (`aspect_aware_resize`):
    - Compute `scale = min(W_target / w, H_target / h)`. The image is scaled uniformly, so no stretching occurs.
@@ -90,14 +92,14 @@ Procedure (`preprocess_signature`):
 ```python
 from signature_preprocessing import preprocess_signature, to_model_input
 
-image = preprocess_signature(stage2_1_output, target_size=(384, 192), ink="light")  # 192 x 384 uint8, black on white
+image = preprocess_signature(stage2_1_output, target_size=(384, 192))  # 192 x 384 uint8 grayscale
 tensor = to_model_input(image)                                                     # 3 x 192 x 384 float32
 ```
 
 Notes:
 
-- The image is binarized *before* resizing, so thresholding sees full-resolution strokes. Resizing then anti-aliases the stroke edges, so the final image has a few gray levels along the strokes. It is deliberately not re-thresholded, because that would erase 1–2 px strokes.
-- Otsu uses one global threshold. If real scans show uneven illumination, an adaptive threshold is an alternative to evaluate; it is not implemented.
+- The image is not binarized. The crop threshold is used only to find the signature bounds; grayscale values are kept through resizing so pressure and ink-flow differences remain available.
+- Illumination flattening uses a morphological background estimate. If real scans show difficult uneven illumination, an adaptive grayscale correction is an alternative to evaluate.
 - Tight cropping discards the absolute position and size of the signature within the box. Relative proportions (aspect ratio) are kept by the uniform scaling. If absolute size is found to be informative, compare against a variant that skips the ink crop in the ablation study (Section 5.4).
 - `convnext_tiny` is fully convolutional with global average pooling, so non-square inputs need no architectural change.
 - The canvas size is a hyperparameter. Compare `224 × 224`, `384 × 192`, and a larger option such as `512 × 256` in the ablation study (Section 5), because the best size depends on the scan DPI and the stroke thickness after cropping.
@@ -189,7 +191,7 @@ $$
 
 1. **Phase 1 (warm-up):** Freeze the ConvNeXt backbone. Train only the projection head for 5–10 epochs with a learning rate of `1 × 10⁻³`, using semi-hard mining.
 2. **Phase 2 (unfreezing):** Unfreeze the last two ConvNeXt stages. Lower the learning rate to `1 × 10⁻⁴` and train for another 20–30 epochs, using batch-hard mining.
-3. **Data augmentation:** Consider small rotations (for example, `±5°`), elastic transformations, and brightness adjustments. Validate augmentations to ensure they preserve meaningful handwriting characteristics and do not create unrealistic samples. Apply augmentation *before* step 2.2 (black-and-white conversion and resize), so the final input is produced by the same path as at inference.
+3. **Data augmentation:** Consider small rotations (for example, `±5°`), elastic transformations, and brightness adjustments. Validate augmentations to ensure they preserve meaningful handwriting characteristics and do not create unrealistic samples. Apply augmentation *before* step 2.2 (grayscale normalization and resize), so the final input is produced by the same path as at inference.
 
 Treat epoch counts and learning rates as initial settings; tune them using signer-disjoint validation data.
 

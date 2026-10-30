@@ -11,13 +11,14 @@ decision system.
 | --- | --- | --- |
 | 1. Signature extraction | Detect and crop signatures from cheque images, currently upstream (for example, YOLO). | Upstream |
 | 2.1 Artifact cleaning | Remove stamps, lines, and noise from the crop. | Upstream |
-| 2.2 Image preprocessing | Convert to black ink on white, crop around ink, resize without stretching, and normalize for the model. | Implemented in [`signature_preprocessing.py`](./signature_preprocessing.py) |
+| 2.2 Image preprocessing | Preserve grayscale stroke intensity, normalize to dark ink on white, crop around ink, resize without stretching, and normalize for the model. | Implemented in [`signature_preprocessing.py`](./signature_preprocessing.py) |
 | 3. Deep metric learning | Train a ConvNeXt-Tiny encoder to map signatures into an embedding space. | Implemented in [`stage3_metric_learning.py`](./stage3_metric_learning.py) and [`train_siamese.py`](./train_siamese.py) |
 | 4. Scoring and verification | Compare embeddings with cosine similarity and evaluate a policy on representative data. | Similarity helper implemented; thresholds and deployment evaluation require project data |
 
-The Stage 2 output expected by Stage 3 is a 384 px wide, 192 px high image
-(`H x W = 192 x 384`, `target_size = (width, height) = (384, 192)`) with black ink
-on a white background. The preprocessing module converts this to an
+The Stage 2 output expected by Stage 3 is a 384 px wide, 192 px high grayscale
+image (`H x W = 192 x 384`, `target_size = (width, height) = (384, 192)`) with
+dark ink on a white background. Grayscale intensity is retained to represent
+stroke pressure and ink flow. The preprocessing module converts this to an
 ImageNet-normalized PyTorch tensor in `C x H x W` order: 3 channels, 192 high,
 384 wide. Keep the same preprocessing options for training and inference.
 
@@ -111,10 +112,11 @@ signers with the requested number of genuine images per batch. Validation
 requires at least two distinct signers with two genuine images each.
 
 By default, the manifest points to upstream Stage 2.1 output images, and the
-dataset applies the project's Stage 2.2 preprocessing path. `--ink auto`
-detects the minority pixel class as ink; choose `--ink light` for white ink on
-black or `--ink dark` for dark ink on a light background if needed. If files
-are already preprocessed 192 x 384 grayscale images, pass
+dataset applies the project's Stage 2.2 preprocessing path. The path preserves
+grayscale intensity rather than reducing pixels to two levels and whitens the
+estimated paper background to 255. It assumes dark signatures on a white or
+whitish background; the legacy `--ink` option remains accepted for compatibility
+but is ignored. If files are already preprocessed 192 x 384 grayscale images, pass
 `--already-preprocessed`.
 
 ## Train
@@ -137,7 +139,7 @@ Useful options:
 ```text
 --image-root PATH                 Base directory for relative image paths
 --device auto|cpu|cuda|mps        Compute device (auto: CUDA, otherwise CPU)
---ink auto|light|dark             Input ink polarity
+--ink auto|light|dark             Legacy compatibility option; ignored
 --already-preprocessed            Require 192x384 grayscale input files
 --no-pretrained                   Initialize ConvNeXt without pretrained weights
 --phase1-epochs N                 Warm-up epochs (default 5)

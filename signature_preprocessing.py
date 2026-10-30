@@ -1,9 +1,11 @@
-"""Stage 2 preprocessing step: black-and-white conversion + aspect-aware resize.
+"""Stage 2 preprocessing step: grayscale normalization + aspect-aware resize.
 
-Input:  a signature image (grayscale or BGR, any size, any ink polarity), i.e. the
-        output of the upstream YOLO crop and artifact cleaning.
-Output: a fixed-size ``(height, width)`` uint8 image, black ink (0) on a white
-        background (255), at the agreed wide aspect ratio. Strokes are never stretched.
+Input:  a signature image (grayscale or BGR, any size, with a white or whitish
+        background), i.e. the output of the upstream YOLO crop and artifact
+        cleaning.
+Output: a fixed-size ``(height, width)`` uint8 grayscale image, dark ink on a
+        white background, at the agreed wide aspect ratio. Stroke intensity is
+        preserved and strokes are never stretched.
 
 ``preprocess_signature`` runs the whole step; the individual functions are exposed for
 testing and ablations.
@@ -22,7 +24,7 @@ DEFAULT_TARGET_SIZE = (384, 192)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-InkPolarity = Literal["auto", "light", "dark"]
+InkPolarity = Literal["auto", "light", "dark"]  # retained for CLI compatibility
 
 
 def _to_gray(image: np.ndarray) -> np.ndarray:
@@ -40,61 +42,59 @@ def _to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def flatten_illumination(gray: np.ndarray) -> np.ndarray:
-    """Divide out the slowly varying background (shadows, lighting gradients).
+    """Whiten slowly varying background (shadows, lighting gradients).
 
-    The background is estimated by morphological closing (dark ink) or opening
-    (light ink), with a kernel larger than the stroke width, then smoothed. The
-    polarity is guessed from the median level, since the background dominates.
-    Returns an image where the background is ~255 and ink keeps its contrast.
+    The input must have dark ink on a lighter background. The background is
+    estimated by morphological closing with a kernel larger than the stroke
+    width, then smoothed. Returns an image where the background is ~255 and
+    grayscale ink contrast is preserved.
     """
-    dark_ink = np.median(gray) > 127
-    work = gray if dark_ink else 255 - gray
-
-    k = max(15, (min(work.shape[:2]) // 40) | 1)
+    k = max(15, (min(gray.shape[:2]) // 40) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    background = cv2.morphologyEx(work, cv2.MORPH_CLOSE, kernel)
+    background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
     background = cv2.GaussianBlur(background, (0, 0), k / 2)
 
-    flat = cv2.divide(work, np.maximum(background, 1), scale=255)
-    return flat if dark_ink else 255 - flat
+    # Subtract the estimated background variation without quantizing the ink.
+    # Pixels matching the local background are explicitly made pure white.
+    background_gap = background.astype(np.int16) - gray.astype(np.int16)
+    corrected = np.clip(255 - background_gap, 0, 255).astype(np.uint8)
+    corrected[background_gap <= 8] = 255
+    return corrected
 
 
-def to_black_and_white(
+def to_grayscale(
     image: np.ndarray,
     ink: InkPolarity = "auto",
     blur_ksize: int = 0,
     remove_shadow: bool = True,
 ) -> np.ndarray:
-    """Binarize with Otsu's method and return black ink (0) on white (255).
+    """Normalize to grayscale dark ink on a white background without binarizing.
 
     Args:
         image: Grayscale or BGR uint8 image.
-        ink: ``"light"`` for light ink on a dark background (current upstream
-            output), ``"dark"`` for dark ink on a light background, or ``"auto"``.
-            ``"auto"`` treats the minority class as ink (a signature covers far less
-            than half of its crop), which also works when ink touches the borders.
-            An explicit value is safer in production.
-        blur_ksize: Odd Gaussian kernel size applied before thresholding to suppress
-            scanner noise. ``0`` disables it (appropriate for already-clean binary
-            input, where blurring would only soften 1-2 px strokes).
-        remove_shadow: Flatten uneven illumination (shadows, gradients) before
-            thresholding. Disable for already-clean binary input.
+        ink: Retained for compatibility with existing callers. The preprocessing
+            assumes dark ink on a white or whitish background and does not inspect
+            or invert ink polarity.
+        blur_ksize: Odd Gaussian kernel size applied before resizing. ``0``
+            disables it so pressure-dependent intensity is retained.
+        remove_shadow: Flatten uneven illumination while preserving grayscale
+            stroke contrast.
     """
-    gray = _to_gray(image)
+    gray = _to_gray(image).copy()
+    # Ink polarity is intentionally not checked or inverted. Inputs are expected
+    # to have dark signatures on a white or whitish background.
     if remove_shadow:
         gray = flatten_illumination(gray)
+    else:
+        # Also support callers that skip illumination correction while removing
+        # small residual tint from an otherwise white background.
+        gray[gray >= 245] = 255
     if blur_ksize:
         if blur_ksize % 2 == 0:
             raise ValueError("blur_ksize must be odd")
         gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
 
-    # Otsu picks the threshold itself; white (255) = pixels above it.
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    #TODO: I will comment this out for now, because it is not needed for the current use case(training). We can re-enable it later if needed.
-    # if ink == "auto":
-    #     ink = "dark" if np.count_nonzero(binary) > binary.size / 2 else "light"
-    # return 255 - binary if ink == "light" else binary
-    return binary
+    return gray
 
 def crop_to_ink(
     image: np.ndarray,
@@ -102,12 +102,13 @@ def crop_to_ink(
     ink_threshold: int = 128,
     min_ink_pixels: int = 5,
 ) -> np.ndarray:
-    """Crop a black-ink-on-white image to the ink bounding box plus a margin.
+    """Crop a grayscale dark-ink-on-white image to the ink box plus a margin.
 
     Args:
         image: Single-channel uint8 image with dark ink on a white background.
         margin: Padding around the ink box, as a fraction of the box's larger side.
-        ink_threshold: Pixels below this value count as ink.
+        ink_threshold: Pixels below this value count as ink for locating the
+            signature. The original grayscale values are returned unchanged.
         min_ink_pixels: If fewer ink pixels are found the image is treated as empty
             and ``ValueError`` is raised, so the caller can route it to review.
     """
@@ -130,8 +131,8 @@ def aspect_aware_resize(
     """Scale ``image`` to fit inside ``target_size`` and pad it to the exact size.
 
     The aspect ratio is preserved: the image is scaled uniformly, centered, and the
-    remaining area is filled with ``pad_value``, which must equal the background
-    level of ``image`` (255 after ``to_black_and_white``).
+    remaining area is filled with ``pad_value`` (255 for normalized grayscale
+    images).
 
     Args:
         image: ``H x W`` or ``H x W x C`` uint8 array.
@@ -171,20 +172,19 @@ def preprocess_signature(
     margin: float = 0.05,
     blur_ksize: int = 0,
 ) -> np.ndarray:
-    """Black-and-white conversion, tight crop, and aspect-aware resize.
+    """Grayscale normalization, tight crop, and aspect-aware resize.
 
-    The image is binarized *before* resizing, so thresholding sees the full-resolution
-    strokes. Resizing then anti-aliases the stroke edges (gray levels near the strokes);
-    the result is not re-thresholded, because that would erase 1-2 px strokes.
+    The threshold is used only to locate the signature for cropping. The output
+    remains grayscale, so stroke and pressure variations are preserved.
 
     Returns:
-        ``target_h x target_w`` uint8 image, black ink on white.
+        ``target_h x target_w`` uint8 grayscale image, dark ink on white.
 
     Raises:
         ValueError: If the input is invalid or contains no ink.
     """
-    bw = to_black_and_white(image, ink=ink, blur_ksize=blur_ksize)
-    cropped = crop_to_ink(bw, margin=margin)
+    grayscale = to_grayscale(image, ink=ink, blur_ksize=blur_ksize)
+    cropped = crop_to_ink(grayscale, margin=margin)
     return aspect_aware_resize(cropped, target_size, pad_value=255)
 
 

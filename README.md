@@ -45,10 +45,12 @@ signers with two genuine images each, and enough training signers with the
 requested number of genuine images for each batch.
 
 By default, images are read as Stage 2.1 outputs and passed through
-`preprocess_signature` using the same Stage 2.2 path as inference. For already
-preprocessed 192x384 grayscale images, pass `--already-preprocessed`.
-`--ink auto` is the default; set `--ink light` for white ink on black from the
-upstream pipeline or `--ink dark` for dark ink on a light background.
+`preprocess_signature` using the same Stage 2.2 path as inference. Stage 2.2
+preserves grayscale stroke intensity so pressure and ink flow are not lost and
+whitens the estimated paper background to 255. For already preprocessed 192x384
+grayscale images, pass `--already-preprocessed`. The preprocessing assumes dark
+signatures on a white or whitish background. The legacy `--ink` option remains
+accepted for compatibility but is ignored.
 
 ### Train
 
