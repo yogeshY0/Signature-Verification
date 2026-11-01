@@ -10,7 +10,7 @@ This document outlines the architecture and implementation steps for an offline 
 The architecture has four main stages:
 
 1. **Extraction (YOLO):** Locate and crop the signature. *Implemented upstream.*
-2. **Preprocessing:** (2.1) Reduce banking artifacts such as stamps, lines, and noise (*implemented upstream*), then (2.2) normalize the signature to grayscale and resize it to the agreed wide aspect ratio (*implemented in [signature_preprocessing.py](./signature_preprocessing.py)*).
+2. **Preprocessing:** (2.1) Reduce banking artifacts such as stamps, lines, and noise (*implemented upstream*), then (2.2) normalize the signature to grayscale and resize it to the agreed wide aspect ratio (*implemented in [signature_preprocessing.py](../preprocessing/signature_preprocessing.py)*).
 3. **Feature extraction (ConvNeXt Siamese):** Convert the preprocessed image into a dense vector.
 4. **Scoring engine:** Calculate a similarity score for the pair.
 
@@ -48,7 +48,7 @@ Stage 2 has two steps:
 | Step | Responsibility | Status |
 | --- | --- | --- |
 | 2.1 Artifact cleaning | Remove stamps, printed lines, and noise from the YOLO crop. | Done upstream (outside this repository) |
-| 2.2 Grayscale normalization and aspect-aware resize | Preserve stroke intensity, normalize polarity, and create a fixed-size, wide-aspect model input. | **Implemented** in [signature_preprocessing.py](./signature_preprocessing.py) |
+| 2.2 Grayscale normalization and aspect-aware resize | Preserve stroke intensity, normalize polarity, and create a fixed-size, wide-aspect model input. | **Implemented** in [signature_preprocessing.py](../preprocessing/signature_preprocessing.py) |
 
 Gate crops with low YOLO confidence or multiple detections before Stage 2. Empty images (no ink) are rejected in step 2.2 with a `ValueError`, so they can be routed to review instead of being scored.
 
@@ -90,7 +90,7 @@ Procedure (`preprocess_signature`):
 4. **Model tensor** (`to_model_input`, called by Stage 3): replicate the single channel to 3 channels and normalize with ImageNet mean and standard deviation, to use the pretrained weights unchanged.
 
 ```python
-from signature_preprocessing import preprocess_signature, to_model_input
+from preprocessing.signature_preprocessing import preprocess_signature, to_model_input
 
 image = preprocess_signature(stage2_1_output, target_size=(384, 192))  # 192 x 384 uint8 grayscale
 tensor = to_model_input(image)                                                     # 3 x 192 x 384 float32
@@ -109,7 +109,7 @@ Notes:
 
 Rather than classifying signatures into identity classes, the network learns an embedding space in which genuine signatures from the same person are close together and dissimilar signatures are farther apart. The network is trained with **triplet loss and batch-hard mining** (Section 4) and used pairwise at inference time.
 
-The initial training implementation is in [stage3_metric_learning.py](./stage3_metric_learning.py) and [train_siamese.py](./train_siamese.py). It uses the manifest, input preprocessing, two-phase training, and batch composition described in [README.md](./README.md). Training requires a signer-disjoint validation split and labeled signature images; none are included in this repository.
+The initial training implementation is in [stage3_metric_learning.py](../training/stage3_metric_learning.py) and [train_siamese.py](../training/train_siamese.py). It uses the manifest, input preprocessing, two-phase training, and batch composition described in [README.md](../README.md). Training requires a signer-disjoint validation split and labeled signature images; none are included in this repository.
 
 #### Architecture: ConvNeXt-Tiny
 

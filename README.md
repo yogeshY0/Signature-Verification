@@ -55,7 +55,7 @@ accepted for compatibility but is ignored.
 ### Train
 
 ```bash
-python train_siamese.py \
+python -m training.train_siamese \
   --manifest data/manifest.csv \
   --output-dir checkpoints/stage3
 ```
@@ -65,10 +65,11 @@ mining, then 20 epochs with the final two backbone stages unfrozen and
 batch-hard mining. The default batch uses 12 signers, 4 genuine samples per
 signer, and up to 2 skilled forgeries per signer. Adjust batch size and epoch
 counts for available data and hardware. Checkpoints are selected by
-signer-disjoint validation loss and written to `checkpoints/stage3/best_model.pt`.
+signer-disjoint validation loss (always computed with batch-hard mining so
+warm-up and fine-tune losses are comparable) and written to `checkpoints/stage3/best_model.pt`.
 
 Run the focused checks with:
 
 ```bash
-python -m unittest test_stage3_metric_learning.py
+python -m unittest discover -s tests -t .
 ```

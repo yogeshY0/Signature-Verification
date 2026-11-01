@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from signature_preprocessing import DEFAULT_TARGET_SIZE
-from stage3_metric_learning import (
+from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
+from training.stage3_metric_learning import (
     PKBatchSampler,
     SignatureDataset,
     SiameseSignatureModel,
@@ -223,11 +223,13 @@ def main() -> None:
                 margin=args.margin,
                 optimizer=optimizer,
             )
+            # Validate with batch-hard in every phase: semi-hard and batch-hard
+            # losses are not comparable, which would skew best-checkpoint selection.
             validation_metrics = _run_epoch(
                 model,
                 validation_loader,
                 device,
-                mining=mining,
+                mining="batch-hard",
                 margin=args.margin,
             )
             global_epoch += 1

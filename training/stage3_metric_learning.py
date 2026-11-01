@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, Sampler
 
-from signature_preprocessing import (
+from preprocessing.signature_preprocessing import (
     DEFAULT_TARGET_SIZE,
     preprocess_signature,
     to_model_input,
@@ -26,12 +26,15 @@ MiningMode = Literal["semi-hard", "batch-hard"]
 
 @dataclass(frozen=True)
 class SignatureRecord:
+    """One manifest example and the signer whose identity it represents."""
+
     image_path: Path
     signer_id: str
     is_forgery: bool
 
 
 def _parse_bool(value: str, *, row_number: int) -> bool:
+    """Parse common CSV boolean spellings and report invalid values with row context."""
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes"}:
         return True
@@ -53,6 +56,7 @@ def load_manifest(
     must use the ID of the signer they imitate.
     """
     manifest = Path(manifest_path).expanduser().resolve()
+    # Relative paths are rooted at image_root when provided, otherwise beside the CSV.
     root = Path(image_root).expanduser().resolve() if image_root else manifest.parent
     required = {"image_path", "signer_id", "is_forgery", "split"}
     train: list[SignatureRecord] = []
@@ -98,6 +102,7 @@ def load_manifest(
 
     train_signers = {record.signer_id for record in train}
     validation_signers = {record.signer_id for record in validation}
+    # Keep every signer confined to one split so validation does not leak identities.
     overlap = (train_signers & validation_signers) | (train_signers & test_signers) | (
         validation_signers & test_signers
     )
@@ -108,6 +113,8 @@ def load_manifest(
 
 
 class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
+    """Load signatures, preprocess them, and return model-ready tensors and labels."""
+
     def __init__(
         self,
         records: Sequence[SignatureRecord],
@@ -126,6 +133,7 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
 
     def __getitem__(self, index: int) -> tuple[Tensor, int, bool]:
         record = self.records[index]
+        # Already-preprocessed files are grayscale at the model's fixed input size.
         read_mode = cv2.IMREAD_GRAYSCALE if self.already_preprocessed else cv2.IMREAD_COLOR
         image = cv2.imread(str(record.image_path), read_mode)
         if image is None:
@@ -142,12 +150,17 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
         else:
             preprocessed = preprocess_signature(image, ink=self.ink)
 
+        # The model accepts three channels; preprocessing repeats grayscale for RGB.
         tensor = torch.from_numpy(to_model_input(preprocessed))
         return tensor, self.signer_to_index[record.signer_id], record.is_forgery
 
 
 class PKBatchSampler(Sampler[list[int]]):
-    """Sample P distinct signers, K genuine images, and up to F matching forgeries."""
+    """Build batches with P signers, K genuine samples, and up to F forgeries each.
+
+    P and K provide genuine positive pairs across distinct identities. Forgeries
+    are sampled only as optional negatives associated with their imitated signer.
+    """
 
     def __init__(
         self,
@@ -170,6 +183,7 @@ class PKBatchSampler(Sampler[list[int]]):
         self.forgeries_per_signer = forgeries_per_signer
         self.seed = seed
         self.epoch = 0
+        # Keep genuine and forged record indices separate for each signer.
         self.by_signer: dict[str, dict[bool, list[int]]] = {}
         for index, record in enumerate(records):
             groups = self.by_signer.setdefault(record.signer_id, {False: [], True: []})
@@ -180,6 +194,7 @@ class PKBatchSampler(Sampler[list[int]]):
             for signer, groups in self.by_signer.items()
             if len(groups[False]) >= genuine_per_signer
         ]
+        # Each batch needs enough genuine samples per signer to form positives.
         if len(self.eligible_signers) < signers_per_batch:
             raise ValueError(
                 f"need at least {signers_per_batch} signers with "
@@ -187,12 +202,15 @@ class PKBatchSampler(Sampler[list[int]]):
             )
 
     def __len__(self) -> int:
+        # Number of batches per epoch; signers are sampled anew for each batch.
         return max(1, (len(self.eligible_signers) + self.signers_per_batch - 1) // self.signers_per_batch)
 
     def set_epoch(self, epoch: int) -> None:
+        """Change the deterministic sampling sequence for the next epoch."""
         self.epoch = epoch
 
     def __iter__(self) -> Iterator[list[int]]:
+        # A local seeded RNG makes each epoch reproducible without changing global RNG.
         rng = random.Random(self.seed + self.epoch)
         for _ in range(len(self)):
             signer_batch = rng.sample(self.eligible_signers, self.signers_per_batch)
@@ -200,6 +218,7 @@ class PKBatchSampler(Sampler[list[int]]):
             for signer in signer_batch:
                 groups = self.by_signer[signer]
                 indices.extend(rng.sample(groups[False], self.genuine_per_signer))
+                # Not every signer has forgeries; use all available up to the cap.
                 forgery_count = min(self.forgeries_per_signer, len(groups[True]))
                 if forgery_count:
                     indices.extend(rng.sample(groups[True], forgery_count))
@@ -207,7 +226,12 @@ class PKBatchSampler(Sampler[list[int]]):
 
 
 class SiameseSignatureModel(nn.Module):
-    """Shared ConvNeXt-Tiny encoder with a normalized 512-D projection head."""
+    """Map each signature to a normalized embedding using a shared encoder.
+
+    ConvNeXt extracts visual features. The projection head maps them to the
+    embedding space, and L2 normalization makes cosine and Euclidean distances
+    useful for comparing signatures.
+    """
 
     def __init__(self, *, pretrained: bool = True, embedding_dim: int = 512) -> None:
         super().__init__()
@@ -219,6 +243,7 @@ class SiameseSignatureModel(nn.Module):
         )
         self.projection = nn.Sequential(
             nn.Linear(self.backbone.num_features, 512),
+            # LayerNorm acts per sample, independent of PK batch composition.
             nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.2),
@@ -227,6 +252,7 @@ class SiameseSignatureModel(nn.Module):
         self.embedding_dim = embedding_dim
 
     def forward(self, images: Tensor) -> Tensor:
+        """Encode a batch and return one unit-length embedding per image."""
         return F.normalize(self.projection(self.backbone(images)), p=2, dim=1)
 
     def compare(self, reference: Tensor, query: Tensor) -> Tensor:
@@ -236,10 +262,12 @@ class SiameseSignatureModel(nn.Module):
         return F.cosine_similarity(reference_embedding, query_embedding, dim=1)
 
     def freeze_backbone(self) -> None:
+        """Stop gradient updates to the pretrained feature extractor."""
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
 
     def unfreeze_last_stages(self, count: int = 2) -> None:
+        """Freeze the backbone, then enable gradients only in its last stages."""
         stages = getattr(self.backbone, "stages", None)
         if stages is None or count < 1:
             raise ValueError("backbone must expose stages and count must be positive")
@@ -257,7 +285,12 @@ def triplet_loss(
     margin: float = 0.3,
     mining: MiningMode = "batch-hard",
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Mine genuine anchors, genuine positives, and valid random/skilled negatives."""
+    """Compute triplet loss for genuine anchors and return detached diagnostics.
+
+    Positives are other genuine samples from the same signer. Negatives are
+    genuine samples from different signers or forgeries labeled as imitating
+    the anchor's signer. Forged samples never act as anchors or positives.
+    """
     if embeddings.ndim != 2 or signer_ids.ndim != 1 or is_forgery.ndim != 1:
         raise ValueError("expected 2D embeddings and 1D signer/forgery labels")
     if embeddings.shape[0] != signer_ids.shape[0] or embeddings.shape[0] != is_forgery.shape[0]:
@@ -265,11 +298,14 @@ def triplet_loss(
     if mining not in {"semi-hard", "batch-hard"}:
         raise ValueError(f"unsupported mining mode: {mining}")
 
+    # Pairwise distances are used to select examples for each genuine anchor.
     distances = torch.cdist(embeddings.float(), embeddings.float(), p=2)
     same_signer = signer_ids[:, None].eq(signer_ids[None, :])
     genuine = ~is_forgery.bool()
     not_self = ~torch.eye(len(signer_ids), dtype=torch.bool, device=signer_ids.device)
+    # Positives exclude the anchor itself and must be genuine.
     positives = same_signer & genuine[None, :] & not_self
+    # A same-signer forgery is a valid negative because it imitates the anchor.
     negatives = ((~same_signer) & genuine[None, :]) | (
         same_signer & is_forgery.bool()[None, :]
     )
@@ -283,12 +319,15 @@ def triplet_loss(
         raise ValueError("each genuine anchor needs at least one valid negative")
 
     anchor_distances = distances[anchors]
+    # Batch-hard loss takes the farthest valid positive and closest valid negative.
     positive_distances = anchor_distances.masked_fill(~positive_mask, float("-inf"))
     hardest_positive = positive_distances.max(dim=1).values
     negative_distances = anchor_distances.masked_fill(~negative_mask, float("inf"))
     hardest_negative = negative_distances.min(dim=1).values
 
     if mining == "semi-hard":
+        # Choose the nearest negative farther away than the hardest positive but
+        # still within the margin. Fall back to the hardest negative if none qualify.
         semi_hard_mask = (
             negative_mask
             & (anchor_distances > hardest_positive[:, None])
@@ -306,6 +345,7 @@ def triplet_loss(
         selected_negative = hardest_negative
 
     per_anchor_loss = F.relu(hardest_positive - selected_negative + margin)
+    # Metrics are detached so logging them does not retain the autograd graph.
     return per_anchor_loss.mean(), {
         "mean_positive": hardest_positive.mean().detach(),
         "mean_negative": selected_negative.mean().detach(),

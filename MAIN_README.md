@@ -11,8 +11,8 @@ decision system.
 | --- | --- | --- |
 | 1. Signature extraction | Detect and crop signatures from cheque images, currently upstream (for example, YOLO). | Upstream |
 | 2.1 Artifact cleaning | Remove stamps, lines, and noise from the crop. | Upstream |
-| 2.2 Image preprocessing | Preserve grayscale stroke intensity, normalize to dark ink on white, crop around ink, resize without stretching, and normalize for the model. | Implemented in [`signature_preprocessing.py`](./signature_preprocessing.py) |
-| 3. Deep metric learning | Train a ConvNeXt-Tiny encoder to map signatures into an embedding space. | Implemented in [`stage3_metric_learning.py`](./stage3_metric_learning.py) and [`train_siamese.py`](./train_siamese.py) |
+| 2.2 Image preprocessing | Preserve grayscale stroke intensity, normalize to dark ink on white, crop around ink, resize without stretching, and normalize for the model. | Implemented in [`preprocessing/signature_preprocessing.py`](./preprocessing/signature_preprocessing.py) |
+| 3. Deep metric learning | Train a ConvNeXt-Tiny encoder to map signatures into an embedding space. | Implemented in [`training/stage3_metric_learning.py`](./training/stage3_metric_learning.py) and [`training/train_siamese.py`](./training/train_siamese.py) |
 | 4. Scoring and verification | Compare embeddings with cosine similarity and evaluate a policy on representative data. | Similarity helper implemented; thresholds and deployment evaluation require project data |
 
 The Stage 2 output expected by Stage 3 is a 384 px wide, 192 px high grayscale
@@ -82,7 +82,8 @@ Defaults follow the architecture plan:
 The default batch uses 12 signers, 4 genuine signatures per signer, and up to
 2 skilled forgeries per signer. Adjust epochs, batch composition, and device
 for the dataset and available hardware. The best checkpoint is selected by
-signer-disjoint validation loss.
+signer-disjoint validation loss, computed with batch-hard mining in both
+phases so the values are comparable.
 
 ## Dataset manifest
 
@@ -126,7 +127,7 @@ but is ignored. If files are already preprocessed 192 x 384 grayscale images, pa
 From the activated environment:
 
 ```bash
-python train_siamese.py \
+python -m training.train_siamese \
   --manifest data/manifest.csv \
   --output-dir checkpoints/stage3
 ```
@@ -157,7 +158,7 @@ Useful options:
 For example, to run a quick CPU trial without downloading ImageNet weights:
 
 ```bash
-python train_siamese.py \
+python -m training.train_siamese \
   --manifest data/manifest.csv \
   --output-dir checkpoints/stage3-smoke \
   --device cpu \
@@ -174,7 +175,7 @@ batch sizes.
 Run the focused unit tests:
 
 ```bash
-python -m unittest test_stage3_metric_learning.py
+python -m unittest discover -s tests -t .
 ```
 
 The tests cover manifest signer-split validation, P-K batch composition,
@@ -206,4 +207,4 @@ signer-disjoint evaluation on representative real signatures.
    authenticity. Use human review and institution-approved decision policies.
 
 For the full pipeline design, evaluation protocol, and scoring-policy
-discussion, see [`offline_signature_verification_architecture.md`](./offline_signature_verification_architecture.md).
+discussion, see [`offline_signature_verification_architecture.md`](./docs/offline_signature_verification_architecture.md).

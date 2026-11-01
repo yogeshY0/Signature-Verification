@@ -13,7 +13,6 @@ testing and ablations.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 
 import cv2
@@ -100,7 +99,7 @@ def to_grayscale(
 def crop_to_ink(
     image: np.ndarray,
     margin: float = 0.05,
-    ink_threshold: int = 128,
+    ink_threshold: int = 200,
     min_ink_pixels: int = 5,
 ) -> np.ndarray:
     """Crop a grayscale dark-ink-on-white image to the ink box plus a margin.
@@ -114,6 +113,11 @@ def crop_to_ink(
             and ``ValueError`` is raised, so the caller can route it to review.
     """
     mask = image < ink_threshold
+    # Faint scans may have no pixels below the threshold; relax it step by step.
+    for relaxed in (225, 240):
+        if int(mask.sum()) >= min_ink_pixels:
+            break
+        mask = image < relaxed
     if int(mask.sum()) < min_ink_pixels:
         raise ValueError("no signature ink found in image")
 
@@ -203,37 +207,3 @@ def to_model_input(image: np.ndarray) -> np.ndarray:
     array = np.repeat(image[..., None], 3, axis=2).astype(np.float32) / 255.0
     array = (array - IMAGENET_MEAN) / IMAGENET_STD
     return np.ascontiguousarray(array.transpose(2, 0, 1))
-
-
-def save_test_outputs(
-    image_paths: tuple[str, ...] = ("images.jpeg", "images (1).jpeg"),
-    output_dir: str = "preprocessed_outputs",
-) -> None:
-    """Preprocess JPEG signatures and save grayscale and repeated RGB outputs."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    for image_path in image_paths:
-        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            raise FileNotFoundError(f"could not read image: {image_path}")
-
-        grayscale = preprocess_signature(image)
-        repeated_rgb = np.repeat(grayscale[..., None], 3, axis=2)
-        stem = Path(image_path).stem.replace(" ", "_")
-
-        grayscale_path = output_path / f"{stem}_grayscale.png"
-        rgb_path = output_path / f"{stem}_rgb_repeat.png"
-        if not cv2.imwrite(str(grayscale_path), grayscale):
-            raise OSError(f"could not write output: {grayscale_path}")
-        if not cv2.imwrite(str(rgb_path), repeated_rgb):
-            raise OSError(f"could not write output: {rgb_path}")
-
-        print(
-            f"{image_path}: grayscale={grayscale.shape}, "
-            f"rgb_repeat={repeated_rgb.shape}"
-        )
-
-
-if __name__ == "__main__":
-    save_test_outputs()
