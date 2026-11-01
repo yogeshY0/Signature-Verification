@@ -122,6 +122,15 @@ whitish background; the legacy `--ink` option remains accepted for compatibility
 but is ignored. If files are already preprocessed 192 x 384 grayscale images, pass
 `--already-preprocessed`.
 
+### Public-dataset preprocessing (black and white)
+
+Public datasets are prepared once with `python -m preprocessing.build_manifests`
+(per-dataset signer splits in `data/manifests/`, merged into `data/manifest.csv`) and
+`python -m preprocessing.preprocess_dataset` (writes `data/processed/`). This step
+writes pure black-and-white (0/255) 192 x 384 PNGs by default, because BHSig260 is
+already binary; pass `--grayscale` to keep grayscale strokes. Training and inference
+must use matching preprocessing.
+
 ## Train
 
 From the activated environment:

@@ -176,8 +176,13 @@ def preprocess_signature(
     ink: InkPolarity = "auto",
     margin: float = 0.05,
     blur_ksize: int = 0,
+    binarize: bool = False,
 ) -> np.ndarray:
     """Grayscale normalization, tight crop, and aspect-aware resize.
+
+    With ``binarize=True`` the image is Otsu-thresholded to pure black ink (0) on
+    white (255) before cropping, and the resized result is re-thresholded so the
+    output contains only 0 and 255.
 
     The threshold is used only to locate the signature for cropping. The output
     remains grayscale, so stroke and pressure variations are preserved.
@@ -189,8 +194,14 @@ def preprocess_signature(
         ValueError: If the input is invalid or contains no ink.
     """
     grayscale = to_grayscale(image, ink=ink, blur_ksize=blur_ksize)
+    if binarize:
+        _, grayscale = cv2.threshold(grayscale, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     cropped = crop_to_ink(grayscale, margin=margin)
-    return aspect_aware_resize(cropped, target_size, pad_value=255)
+    resized = aspect_aware_resize(cropped, target_size, pad_value=255)
+    if binarize:
+        # Area resampling blurs thin strokes into gray; a high cut keeps them as ink.
+        resized = np.where(resized < 200, 0, 255).astype(np.uint8)
+    return resized
 
 
 def to_model_input(image: np.ndarray) -> np.ndarray:

@@ -1,4 +1,5 @@
-"""One-time preprocessing: raw manifest -> 192x384 grayscale PNGs + processed manifest.
+"""One-time preprocessing: raw manifest -> 192x384 black-and-white PNGs + processed manifest
+(pass --grayscale to keep grayscale strokes).
 
 Usage:
     python -m preprocessing.preprocess_dataset --manifest data/manifest.csv --output-dir data/processed
@@ -24,6 +25,11 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=Path("data/manifest.csv"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--image-root", type=Path, help="Defaults to the manifest's directory.")
+    parser.add_argument(
+        "--grayscale",
+        action="store_true",
+        help="Keep grayscale strokes instead of the default black-and-white output.",
+    )
     args = parser.parse_args()
 
     root = (args.image_root or args.manifest.parent).resolve()
@@ -47,7 +53,7 @@ def main() -> None:
             failures.append(f"{source}: unreadable")
             continue
         try:
-            processed = preprocess_signature(image)
+            processed = preprocess_signature(image, binarize=not args.grayscale)
         except ValueError as error:
             failures.append(f"{source}: {error}")
             continue
