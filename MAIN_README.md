@@ -50,7 +50,9 @@ The first pretrained run may download ConvNeXt weights.
 
 - Backbone: `convnext_tiny` from timm, initialized with ImageNet weights by
   default.
-- Projection head: `Linear → BatchNorm → ReLU → Dropout → Linear`.
+- Projection head: `Linear → LayerNorm → ReLU → Dropout → Linear`.
+  LayerNorm is used because signer-structured PK batches make batch statistics
+  less reliable; it behaves identically in training and inference.
 - Embedding: 512 dimensions, L2-normalized.
 - `SiameseSignatureModel.compare(reference, query)` returns pairwise cosine
   similarities. Similarity is not a calibrated probability.

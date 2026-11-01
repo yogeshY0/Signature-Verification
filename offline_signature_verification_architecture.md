@@ -116,7 +116,7 @@ The initial training implementation is in [stage3_metric_learning.py](./stage3_m
 - **Backbone:** `convnext_tiny` from the `timm` library, initialized with ImageNet pre-trained weights.
 - **Rationale:** ConvNeXt is a modern convolutional architecture designed to combine strong spatial feature extraction with computational efficiency.
 - **Projection head:** The backbone produces a feature representation (commonly 768 dimensions for ConvNeXt-Tiny). Pass it through a custom head:
-  `Linear → BatchNorm → ReLU → Dropout → Linear`.
+  `Linear → LayerNorm → ReLU → Dropout → Linear`. LayerNorm normalizes each signature independently, so it does not depend on the composition of signer-structured PK batches and behaves identically in training and inference.
 - **Embedding:** L2-normalize the final 512-dimensional output vector, `v`.
 
 #### Siamese forward pass

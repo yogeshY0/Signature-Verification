@@ -219,7 +219,7 @@ class SiameseSignatureModel(nn.Module):
         )
         self.projection = nn.Sequential(
             nn.Linear(self.backbone.num_features, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.2),
             nn.Linear(512, embedding_dim),
