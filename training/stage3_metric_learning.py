@@ -15,6 +15,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, Sampler
 
+from preprocessing.augmentation import augment_signature
 from preprocessing.signature_preprocessing import (
     DEFAULT_TARGET_SIZE,
     preprocess_signature,
@@ -122,8 +123,11 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
         *,
         already_preprocessed: bool = False,
         ink: Literal["auto", "light", "dark"] = "auto",
+        augment: bool = False,
     ) -> None:
         self.records = list(records)
+        # Augmentation is for the training split only; evaluation data stays untouched.
+        self.augment = augment
         self.signer_to_index = signer_to_index
         self.already_preprocessed = already_preprocessed
         self.ink = ink
@@ -149,6 +153,9 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
             preprocessed = image
         else:
             preprocessed = preprocess_signature(image, ink=self.ink)
+
+        if self.augment:
+            preprocessed = augment_signature(preprocessed)
 
         # The model accepts three channels; preprocessing repeats grayscale for RGB.
         tensor = torch.from_numpy(to_model_input(preprocessed))

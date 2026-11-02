@@ -100,6 +100,11 @@ def _parse_args() -> argparse.Namespace:
         help="Input files are already 192x384 Stage 2 output images",
     )
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument(
+        "--no-augment",
+        action="store_true",
+        help="Disable training-time augmentation (it is on by default; validation never uses it).",
+    )
     parser.add_argument("--phase1-epochs", type=int, default=5)
     parser.add_argument("--phase2-epochs", type=int, default=20)
     parser.add_argument("--signers-per-batch", type=int, default=12)
@@ -134,6 +139,7 @@ def main() -> None:
         signer_to_index,
         already_preprocessed=args.already_preprocessed,
         ink=args.ink,
+        augment=not args.no_augment,
     )
     validation_dataset = SignatureDataset(
         validation_records,
@@ -257,6 +263,7 @@ def main() -> None:
                         "preprocessing": {
                             "already_preprocessed": args.already_preprocessed,
                             "ink": args.ink,
+                            "augmentation": not args.no_augment,
                             "target_size": list(DEFAULT_TARGET_SIZE),
                         },
                     },

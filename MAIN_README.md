@@ -122,6 +122,16 @@ whitish background; the legacy `--ink` option remains accepted for compatibility
 but is ignored. If files are already preprocessed 192 x 384 grayscale images, pass
 `--already-preprocessed`.
 
+### Training augmentation
+
+Training images get mild random augmentation on the fly (`preprocessing/augmentation.py`):
+rotation up to 5 degrees, shear, 0.9-1.1 scale, shifts up to 5%, occasional stroke
+thickening or thinning, and light noise. Images are never flipped, and binary images stay
+binary. It is applied to the training split only and is on by default; pass
+`--no-augment` to disable it. Nothing is written to disk, so the manifest and
+`data/processed/` are unchanged. Training always starts from the ImageNet weights,
+not from an earlier checkpoint.
+
 ### Public-dataset preprocessing (black and white)
 
 Public datasets are prepared once with `python -m preprocessing.build_manifests`
