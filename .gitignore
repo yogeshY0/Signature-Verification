@@ -5,5 +5,5 @@ __pycache__/
 data/
 checkpoints/
 best_model.pt
-training_curves.png
+training_curve/
 training_log.txt

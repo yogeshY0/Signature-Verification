@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
+from training.evaluate import _embed, _eer_threshold, _pool, _scores
 from training.stage3_metric_learning import (
     PKBatchSampler,
     SignatureDataset,
@@ -79,6 +80,21 @@ def _run_epoch(
     return {name: value / batch_count for name, value in totals.items()}
 
 
+def _validation_eer(
+    model: SiameseSignatureModel,
+    records,
+    *,
+    already_preprocessed: bool,
+    device: torch.device,
+    references: int = 5,
+) -> float:
+    """Skilled-forgery EER on validation signers, using the same protocol as evaluate.py."""
+    embeddings = _embed(model, records, already_preprocessed, device, 64, 0)
+    scores = _scores(records, embeddings, references)
+    genuine, skilled, _ = _pool(scores, sorted(scores))
+    return _eer_threshold(genuine, skilled)[1]
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -101,9 +117,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument(
-        "--no-augment",
+        "--augment",
         action="store_true",
-        help="Disable training-time augmentation (it is on by default; validation never uses it).",
+        help="Enable training-time augmentation (off by default; it hurt EER in our runs; validation never uses it).",
+    )
+    parser.add_argument(
+        "--select-by",
+        choices=("eer", "loss"),
+        default="eer",
+        help="Metric that decides the saved best checkpoint (validation skilled EER or loss).",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("cosine", "constant"),
+        default="cosine",
+        help="Per-phase learning-rate schedule; cosine decays to 1%% of the phase rate.",
     )
     parser.add_argument("--phase1-epochs", type=int, default=5)
     parser.add_argument("--phase2-epochs", type=int, default=20)
@@ -139,7 +167,7 @@ def main() -> None:
         signer_to_index,
         already_preprocessed=args.already_preprocessed,
         ink=args.ink,
-        augment=not args.no_augment,
+        augment=args.augment,
     )
     validation_dataset = SignatureDataset(
         validation_records,
@@ -199,7 +227,21 @@ def main() -> None:
     model = SiameseSignatureModel(pretrained=not args.no_pretrained).to(device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.output_dir / "best_model.pt"
-    best_validation_loss = math.inf
+    best_score = math.inf
+    # EER needs enough genuine signatures per signer for the 5-reference protocol.
+    genuine_per_validation_signer: dict[str, int] = {}
+    for record in validation_records:
+        if not record.is_forgery:
+            genuine_per_validation_signer[record.signer_id] = (
+                genuine_per_validation_signer.get(record.signer_id, 0) + 1
+            )
+    eer_records = [
+        record
+        for record in validation_records
+        if genuine_per_validation_signer.get(record.signer_id, 0) > 5
+    ]
+    if args.select_by == "eer" and not eer_records:
+        raise ValueError("no validation signer has more than 5 genuine signatures for EER selection")
 
     phases: list[tuple[str, int, float, Literal["semi-hard", "batch-hard"]]] = [
         ("warmup", args.phase1_epochs, 1e-3, "semi-hard"),
@@ -218,6 +260,13 @@ def main() -> None:
             (parameter for parameter in model.parameters() if parameter.requires_grad),
             lr=learning_rate,
             weight_decay=1e-4,
+        )
+        scheduler = (
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=epoch_count, eta_min=learning_rate * 0.01
+            )
+            if args.lr_schedule == "cosine"
+            else None
         )
         for phase_epoch in range(epoch_count):
             train_sampler.set_epoch(global_epoch)
@@ -239,31 +288,45 @@ def main() -> None:
                 margin=args.margin,
             )
             global_epoch += 1
+            validation_eer = _validation_eer(
+                model,
+                eer_records,
+                already_preprocessed=args.already_preprocessed,
+                device=device,
+            ) if eer_records else math.nan
+            learning_rate_used = optimizer.param_groups[0]["lr"]
+            if scheduler is not None:
+                scheduler.step()
             print(
                 json.dumps(
                     {
                         "phase": phase_name,
                         "epoch": phase_epoch + 1,
+                        "lr": learning_rate_used,
                         "train": train_metrics,
                         "validation": validation_metrics,
+                        "validation_eer_skilled": validation_eer,
                     }
                 )
             )
 
-            if validation_metrics["loss"] < best_validation_loss:
-                best_validation_loss = validation_metrics["loss"]
+            score = validation_eer if args.select_by == "eer" else validation_metrics["loss"]
+            if score < best_score:
+                best_score = score
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
                         "embedding_dim": model.embedding_dim,
-                        "best_validation_loss": best_validation_loss,
+                        "best_validation_loss": validation_metrics["loss"],
+                        "best_validation_eer": validation_eer,
+                        "selected_by": args.select_by,
                         "epoch": global_epoch,
                         "phase": phase_name,
                         "seed": args.seed,
                         "preprocessing": {
                             "already_preprocessed": args.already_preprocessed,
                             "ink": args.ink,
-                            "augmentation": not args.no_augment,
+                            "augmentation": args.augment,
                             "target_size": list(DEFAULT_TARGET_SIZE),
                         },
                     },

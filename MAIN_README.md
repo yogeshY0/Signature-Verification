@@ -81,9 +81,11 @@ Defaults follow the architecture plan:
 
 The default batch uses 12 signers, 4 genuine signatures per signer, and up to
 2 skilled forgeries per signer. Adjust epochs, batch composition, and device
-for the dataset and available hardware. The best checkpoint is selected by
-signer-disjoint validation loss, computed with batch-hard mining in both
-phases so the values are comparable.
+for the dataset and available hardware. Within each phase the learning rate follows a
+cosine decay to 1% of its starting value (`--lr-schedule constant` disables it). The
+best checkpoint is selected by the skilled-forgery EER on the signer-disjoint validation
+set, using the same 5-reference protocol as `training/evaluate.py` (`--select-by loss`
+selects by validation loss instead, computed with batch-hard mining in both phases).
 
 ## Dataset manifest
 
@@ -124,11 +126,12 @@ but is ignored. If files are already preprocessed 192 x 384 grayscale images, pa
 
 ### Training augmentation
 
-Training images get mild random augmentation on the fly (`preprocessing/augmentation.py`):
+Augmentation is **off by default**: in two seeds each it raised skilled-forgery EER
+(about 15.7% vs 12.1% average). Pass `--augment` to enable it. When enabled, training
+images get mild random augmentation on the fly (`preprocessing/augmentation.py`):
 rotation up to 5 degrees, shear, 0.9-1.1 scale, shifts up to 5%, occasional stroke
 thickening or thinning, and light noise. Images are never flipped, and binary images stay
-binary. It is applied to the training split only and is on by default; pass
-`--no-augment` to disable it. Nothing is written to disk, so the manifest and
+binary. It is applied to the training split only. Nothing is written to disk, so the manifest and
 `data/processed/` are unchanged. Training always starts from the ImageNet weights,
 not from an earlier checkpoint.
 

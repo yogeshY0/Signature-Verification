@@ -76,7 +76,7 @@ unfreezes the last two stages. Augmentation is on by default for the training sp
 .venv/bin/python -m training.train_siamese \
   --manifest data/processed/manifest.csv --already-preprocessed \
   --output-dir checkpoints/v2 --device cuda --workers 2 \
-  --phase1-epochs 5 --phase2-epochs 40
+  --phase1-epochs 5 --phase2-epochs 30
 ```
 
 | Option | Default | Meaning |
@@ -86,11 +86,16 @@ unfreezes the last two stages. Augmentation is on by default for the training sp
 | `--genuine-per-signer` | 4 | Genuine signatures per signer in a batch |
 | `--forgeries-per-signer` | 2 | Forgeries per signer in a batch |
 | `--margin` | 0.3 | Triplet-loss margin |
-| `--no-augment` | off | Turn augmentation off |
+| `--augment` | off | Turn augmentation on (it raised skilled EER from about 12% to about 16% in our runs) |
+| `--select-by` | eer | Pick the saved checkpoint by validation skilled EER (`eer`) or validation loss (`loss`) |
+| `--lr-schedule` | cosine | Cosine decay within each phase to 1% of its rate; `constant` for the old behaviour |
 | `--no-pretrained` | off | Random weights instead of ImageNet (smoke tests only) |
 
-The best checkpoint by validation loss is saved as `<output-dir>/best_model.pt`. One JSON
-line is printed per epoch.
+The best checkpoint (by validation EER by default) is saved as `<output-dir>/best_model.pt`.
+One JSON line per epoch is printed, including `lr` and `validation_eer_skilled`. Computing
+the EER adds a few seconds per epoch on a GPU. Because the checkpoint and the evaluation
+threshold are both chosen on the validation signers, the validation EER is slightly optimistic;
+trust the test numbers.
 
 ### On Kaggle
 
@@ -130,6 +135,11 @@ it analyzes the last one.
 
 The threshold is chosen on the validation signers and applied to the test signers. The
 output reports FAR, FRR and EER against skilled forgeries and against random forgeries.
+
+The JSON has three parts: `test` (all test signers pooled), `test_per_dataset` (CEDAR,
+Bengali, Hindi separately; random negatives come from the same dataset only), and
+`confidence_95` inside each (signer-level bootstrap intervals). `--bootstrap N` sets the
+number of resamples (default 1000, `0` disables). Evaluation takes several minutes on CPU.
 Each signer is enrolled with the first 5 genuine signatures (`--references` changes this).
 Add `--device cpu` if there is no GPU.
 

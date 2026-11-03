@@ -65,7 +65,7 @@ def main() -> None:
         if best >= len(val) - w and val_change < -0.002:
             print("Verdict: validation loss is still falling -> undertrained; train longer.")
         elif train_change < 0 and val_change > 0.002:
-            print("Verdict: train falls while validation rises -> overfitting; add augmentation.")
+            print("Verdict: train falls while validation rises -> overfitting; try a lower learning rate, fewer epochs, or more data.")
         else:
             print("Verdict: validation loss has flattened; more epochs alone will help little.")
 
