@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
-from training.evaluate import _embed, _eer_threshold, _pool, _scores
+from training.evaluate import _accuracy, _embed, _eer_threshold, _pool, _scores
 from training.stage3_metric_learning import (
     PKBatchSampler,
     SignatureDataset,
@@ -87,12 +87,18 @@ def _validation_eer(
     already_preprocessed: bool,
     device: torch.device,
     references: int = 5,
-) -> float:
-    """Skilled-forgery EER on validation signers, using the same protocol as evaluate.py."""
+    thresholds: tuple[float, ...] = (),
+) -> tuple[float, dict[str, float]]:
+    """Skilled-forgery EER and accuracy at fixed thresholds on validation signers.
+
+    Uses the same protocol as evaluate.py. Accuracy counts genuine and skilled-forgery
+    queries only.
+    """
     embeddings = _embed(model, records, already_preprocessed, device, 64, 0)
     scores = _scores(records, embeddings, references)
     genuine, skilled, _ = _pool(scores, sorted(scores))
-    return _eer_threshold(genuine, skilled)[1]
+    accuracy = {f"{t:g}": _accuracy(genuine, skilled, t) for t in thresholds}
+    return _eer_threshold(genuine, skilled)[1], accuracy
 
 
 def _set_seed(seed: int) -> None:
@@ -141,6 +147,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--margin", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--accuracy-thresholds",
+        type=float,
+        nargs="*",
+        default=[0.7, 0.8, 0.9],
+        help="Similarity thresholds at which validation accuracy is logged each epoch.",
+    )
     return parser.parse_args()
 
 
@@ -288,12 +301,13 @@ def main() -> None:
                 margin=args.margin,
             )
             global_epoch += 1
-            validation_eer = _validation_eer(
+            validation_eer, validation_accuracy = _validation_eer(
                 model,
                 eer_records,
                 already_preprocessed=args.already_preprocessed,
                 device=device,
-            ) if eer_records else math.nan
+                thresholds=tuple(args.accuracy_thresholds),
+            ) if eer_records else (math.nan, {})
             learning_rate_used = optimizer.param_groups[0]["lr"]
             if scheduler is not None:
                 scheduler.step()
@@ -306,6 +320,7 @@ def main() -> None:
                         "train": train_metrics,
                         "validation": validation_metrics,
                         "validation_eer_skilled": validation_eer,
+                        "validation_accuracy_skilled": validation_accuracy,
                     }
                 )
             )

@@ -96,11 +96,147 @@ def to_grayscale(
 
     return gray
 
+def remove_border_artifacts(
+    gray: np.ndarray,
+    ink_threshold: int = 200,
+    max_thickness: float = 0.03,
+    min_elongation: float = 5.0,
+    border_zone: float = 0.10,
+) -> np.ndarray:
+    """Whiten thin straight ink lines that lie in the border zone of the image.
+
+    Scan edges, page shadows and ruled lines show up as long thin lines near the
+    border. They are not part of the signature but would stretch the crop box.
+    Binarization often breaks them into pieces that no longer touch the border, so a
+    component is removed when it lies within ``border_zone`` (fraction of the image
+    size) of an edge, is at most ``max_thickness`` of the image's short side thick, is
+    at least ``min_elongation`` times longer than thick, and is fairly solid (a
+    straight line fills its bounding box; handwriting strokes do not).
+    """
+    mask = (gray < ink_threshold).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    h, w = gray.shape[:2]
+    limit = max_thickness * min(h, w)
+    cleaned = gray.copy()
+    for label in range(1, count):
+        x, y, bw, bh, area = stats[label]
+        thin, long_ = min(bw, bh), max(bw, bh)
+        near_border = (
+            x <= border_zone * w
+            or x + bw >= (1 - border_zone) * w
+            or y <= border_zone * h
+            or y + bh >= (1 - border_zone) * h
+        )
+        straight = area >= 0.3 * bw * bh
+        if near_border and thin <= limit and long_ >= min_elongation * thin and straight:
+            cleaned[labels == label] = 255
+    return _remove_attached_border_lines(cleaned, ink_threshold, max_thickness)
+
+
+def _remove_attached_border_lines(
+    gray: np.ndarray,
+    ink_threshold: int,
+    max_thickness: float,
+    zone: float = 0.06,
+    min_length: float = 0.30,
+    edge_band: float = 0.03,
+    min_fragment_elongation: float = 4.0,
+) -> np.ndarray:
+    """Erase long straight runs near the image edge even when joined to the writing.
+
+    Edge lines are often bridged to the signature by a few pixels, so they form one
+    big component and the component test cannot isolate them. Here a horizontal (or
+    vertical) opening with a long kernel keeps only runs at least ``min_length`` of the
+    image width (height) long, restricted to the strip within ``zone`` of the matching
+    edges. The kernel is long so ordinary strokes and stems are never matched; thick
+    results are kept too. Leftover fragments lying entirely in the outermost
+    ``edge_band`` are removed only if they are elongated along that edge, so writing
+    that merely touches the edge is kept.
+    """
+    h, w = gray.shape[:2]
+    mask = (gray < ink_threshold).astype(np.uint8)
+    limit = max_thickness * min(h, w)
+    lines = np.zeros_like(mask)
+    for horizontal in (True, False):
+        length = max(3, int(round(min_length * (w if horizontal else h))))
+        kernel = np.ones((1, length) if horizontal else (length, 1), np.uint8)
+        runs = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        strip = np.zeros_like(mask)
+        if horizontal:
+            strip[: int(zone * h) + 1] = 1
+            strip[int((1 - zone) * h) :] = 1
+        else:
+            strip[:, : int(zone * w) + 1] = 1
+            strip[:, int((1 - zone) * w) :] = 1
+        runs = runs & strip
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(runs, connectivity=8)
+        for label in range(1, count):
+            bw, bh = stats[label, cv2.CC_STAT_WIDTH], stats[label, cv2.CC_STAT_HEIGHT]
+            if min(bw, bh) <= limit:
+                lines[labels == label] = 1
+
+    if lines.any():
+        # Dilate to catch the anti-aliased edge of the line without touching far strokes.
+        lines = cv2.dilate(lines, np.ones((3, 3), np.uint8))
+        mask = mask & (1 - lines)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    band_y, band_x = edge_band * h, edge_band * w
+    remove = np.zeros(count, bool)
+    for label in range(1, count):
+        x, y, bw, bh, _ = stats[label]
+        horizontal_edge = y + bh <= band_y or y >= h - band_y
+        vertical_edge = x + bw <= band_x or x >= w - band_x
+        remove[label] = (horizontal_edge and bw >= min_fragment_elongation * bh) or (
+            vertical_edge and bh >= min_fragment_elongation * bw
+        )
+    cleaned = gray.copy()
+    cleaned[(lines > 0) | remove[labels]] = 255
+    return cleaned
+
+
+def _drop_distant_small_marks(
+    stats: np.ndarray,
+    labels: list[int],
+    scale: int,
+    small_fraction: float = 0.02,
+    max_gap: float = 0.08,
+) -> list[int]:
+    """Drop small ink components that sit far from the rest of the writing.
+
+    A component is a stray mark if its ink is under ``small_fraction`` of all ink and the
+    gap between its box and the nearest other component's box exceeds ``max_gap`` of the
+    image's larger side. Dots and marks near the writing (i-dots, punctuation) are kept.
+    """
+    areas = {i: int(stats[i, cv2.CC_STAT_AREA]) for i in labels}
+    total = sum(areas.values())
+
+    def box(i: int) -> tuple[int, int, int, int]:
+        x, y = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+        return x, y, x + int(stats[i, cv2.CC_STAT_WIDTH]), y + int(stats[i, cv2.CC_STAT_HEIGHT])
+
+    def gap(a: int, b: int) -> float:
+        ax0, ay0, ax1, ay1 = box(a)
+        bx0, by0, bx1, by1 = box(b)
+        return float(max(0, bx0 - ax1, ax0 - bx1, by0 - ay1, ay0 - by1))
+
+    strays = {i for i in labels if areas[i] < small_fraction * total}
+    anchors = [i for i in labels if i not in strays]
+    if not anchors:
+        return labels
+    keep = list(anchors)
+    for i in strays:
+        if min(gap(i, j) for j in anchors) <= max_gap * scale:
+            keep.append(i)
+    return keep
+
+
 def crop_to_ink(
     image: np.ndarray,
     margin: float = 0.05,
     ink_threshold: int = 200,
     min_ink_pixels: int = 5,
+    min_speck_fraction: float = 0.0001,
 ) -> np.ndarray:
     """Crop a grayscale dark-ink-on-white image to the ink box plus a margin.
 
@@ -111,6 +247,9 @@ def crop_to_ink(
             signature. The original grayscale values are returned unchanged.
         min_ink_pixels: If fewer ink pixels are found the image is treated as empty
             and ``ValueError`` is raised, so the caller can route it to review.
+        min_speck_fraction: Connected ink components smaller than this fraction of
+            the image area (dust, scan specks) are ignored when locating the ink box,
+            so isolated specks do not stretch the crop. Ignored if nothing else is left.
     """
     mask = image < ink_threshold
     # Faint scans may have no pixels below the threshold; relax it step by step.
@@ -120,6 +259,14 @@ def crop_to_ink(
         mask = image < relaxed
     if int(mask.sum()) < min_ink_pixels:
         raise ValueError("no signature ink found in image")
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    big = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= min_speck_fraction * mask.size]
+    if big:
+        keep = _drop_distant_small_marks(stats, big, max(image.shape[:2]))
+        mask = np.isin(labels, keep)
 
     ys, xs = np.where(mask)
     x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
@@ -196,7 +343,7 @@ def preprocess_signature(
     grayscale = to_grayscale(image, ink=ink, blur_ksize=blur_ksize)
     if binarize:
         _, grayscale = cv2.threshold(grayscale, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    cropped = crop_to_ink(grayscale, margin=margin)
+    cropped = crop_to_ink(remove_border_artifacts(grayscale), margin=margin)
     resized = aspect_aware_resize(cropped, target_size, pad_value=255)
     if binarize:
         # Area resampling blurs thin strokes into gray; a high cut keeps them as ink.

@@ -1,4 +1,4 @@
-"""Build the BHSig260 manifest and merge all per-dataset manifests.
+"""Build the BHSig260 and SOHI manifests and merge all per-dataset manifests.
 
 Per-dataset manifests live in ``data/manifests/<name>.csv`` with image paths relative
 to ``data/``. Each has its own signer-disjoint split. This script writes
@@ -19,6 +19,8 @@ from pathlib import Path
 DATA = Path("data")
 FIELDS = ["image_path", "signer_id", "is_forgery", "split"]
 NAME = re.compile(r"^([BH])-S-(\d+)-([GF])-\d+\.tif$", re.IGNORECASE)
+# Two SOHI files are named like "P006_G02png.png"; the stray "png" is tolerated.
+SOHI_NAME = re.compile(r"^P(\d+)_([GF])\d+(?:png)?\.png$", re.IGNORECASE)
 LANGUAGE = {"B": "bn", "H": "hi"}
 
 
@@ -58,6 +60,30 @@ def build_bhsig260() -> None:
     write(DATA / "manifests" / "bhsig260.csv", rows)
 
 
+def build_sohi() -> None:
+    root = DATA / "raw" / "SOHI"
+    rows: list[dict[str, str]] = []
+    for path in sorted(root.rglob("*.png")):
+        match = SOHI_NAME.match(path.name)
+        if not match:
+            raise ValueError(f"unexpected file name: {path}")
+        number, kind = match.groups()
+        is_forgery = kind.upper() == "F"
+        if is_forgery != (path.parent.name.lower() == "forged"):
+            raise ValueError(f"folder and file name disagree: {path}")
+        if path.parent.parent.name != f"P{number}":
+            raise ValueError(f"signer folder and file name disagree: {path}")
+        rows.append(
+            {
+                "image_path": path.relative_to(DATA).as_posix(),
+                "signer_id": f"sohi_{int(number):03d}",
+                "is_forgery": str(is_forgery).lower(),
+            }
+        )
+    splits = split_signers(sorted({r["signer_id"] for r in rows}))
+    write(DATA / "manifests" / "sohi.csv", [{**r, "split": splits[r["signer_id"]]} for r in rows])
+
+
 def write(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
@@ -76,4 +102,5 @@ def merge() -> None:
 
 if __name__ == "__main__":
     build_bhsig260()
+    build_sohi()
     merge()

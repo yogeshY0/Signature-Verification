@@ -137,12 +137,15 @@ not from an earlier checkpoint.
 
 ### Public-dataset preprocessing (black and white)
 
-Public datasets are prepared once with `python -m preprocessing.build_manifests`
+Public datasets (CEDAR, BHSig260, SOHI) are prepared once with `python -m preprocessing.build_manifests`
 (per-dataset signer splits in `data/manifests/`, merged into `data/manifest.csv`) and
 `python -m preprocessing.preprocess_dataset` (writes `data/processed/`). This step
 writes pure black-and-white (0/255) 192 x 384 PNGs by default, because BHSig260 is
-already binary; pass `--grayscale` to keep grayscale strokes. Training and inference
-must use matching preprocessing.
+already binary; pass `--grayscale` to keep grayscale strokes. Before cropping, thin straight
+lines near the image border (scan edges, box lines, including lines joined to the writing)
+are erased, and small stray marks far from the writing are ignored when locating the
+signature box, so they do not shrink the signature. Nearby dots such as i-dots are kept.
+Training and inference must use matching preprocessing.
 
 ## Train
 

@@ -126,6 +126,12 @@ def _rates(genuine, negatives, threshold):
     return far, frr
 
 
+def _accuracy(genuine, skilled, threshold) -> float:
+    """Correct decisions / all decisions over genuine and skilled-forgery queries only."""
+    correct = (genuine >= threshold).sum() + (skilled < threshold).sum()
+    return float(correct / (len(genuine) + len(skilled)))
+
+
 def _eer_threshold(genuine, negatives):
     """Threshold where FAR and FRR are closest, and the EER there (sort-based, O(n log n))."""
     candidates = np.unique(np.concatenate([genuine, negatives]))
@@ -140,6 +146,9 @@ def _metrics(genuine, skilled, random, threshold) -> dict[str, float]:
     far_skilled, frr = _rates(genuine, skilled, threshold)
     far_random, _ = _rates(genuine, random, threshold)
     return {
+        # Genuine vs skilled forgeries only (random pairs excluded).
+        "accuracy_skilled": _accuracy(genuine, skilled, threshold),
+        "balanced_accuracy_skilled": ((1 - frr) + (1 - far_skilled)) / 2,
         "eer_skilled": _eer_threshold(genuine, skilled)[1],
         "eer_random": _eer_threshold(genuine, random)[1],
         "far_skilled_at_threshold": far_skilled,
@@ -188,6 +197,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument(
+        "--threshold",
+        type=float,
+        help="Fixed cosine-similarity threshold. Default: the validation skilled-EER point.",
+    )
+    parser.add_argument(
         "--bootstrap", type=int, default=1000, help="Signer resamples for 95%% intervals; 0 disables."
     )
     args = parser.parse_args()
@@ -211,7 +225,8 @@ def main() -> None:
     # Threshold from validation signers; "skilled" is the harder and more relevant case.
     val_signers = sorted(results["val"])
     val_gen, val_skilled, _ = _pool(results["val"], val_signers)
-    threshold, val_eer = _eer_threshold(val_gen, val_skilled)
+    eer_threshold, val_eer = _eer_threshold(val_gen, val_skilled)
+    threshold = eer_threshold if args.threshold is None else args.threshold
 
     test_scores = results["test"]
     test_signers = sorted(test_scores)
@@ -229,7 +244,9 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "threshold_from_validation": threshold,
+                "threshold_from_validation": eer_threshold,
+                "threshold_used": threshold,
+                "threshold_source": "validation_eer" if args.threshold is None else "user",
                 "validation_eer_skilled": val_eer,
                 "test": _summary(test_scores, test_signers, threshold, args.bootstrap),
                 "test_per_dataset": per_dataset,

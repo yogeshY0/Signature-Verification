@@ -72,12 +72,26 @@ def main() -> None:
     if args.plot:
         import matplotlib.pyplot as plt
 
-        plt.plot(range(1, len(val) + 1), train, label="train loss")
-        plt.plot(range(1, len(val) + 1), val, label="validation loss")
-        plt.xlabel("epoch")
-        plt.ylabel("loss")
-        plt.legend()
-        plt.savefig(args.plot, dpi=120)
+        x = range(1, len(val) + 1)
+        accuracy = [e.get("validation_accuracy_skilled") for e in epochs]
+        has_accuracy = all(a for a in accuracy)
+        fig, axes = plt.subplots(1, 2 if has_accuracy else 1, figsize=(11 if has_accuracy else 6, 4))
+        loss_ax = axes[0] if has_accuracy else axes
+        loss_ax.plot(x, train, label="train loss")
+        loss_ax.plot(x, val, label="validation loss")
+        loss_ax.set_xlabel("epoch")
+        loss_ax.set_ylabel("loss")
+        loss_ax.legend()
+        if has_accuracy:
+            for threshold in accuracy[0]:
+                axes[1].plot(x, [100 * a[threshold] for a in accuracy], label=f"threshold {threshold}")
+            axes[1].set_xlabel("epoch")
+            axes[1].set_ylabel("validation accuracy (%)")
+            axes[1].set_title("correct / (genuine + skilled-forgery queries)", fontsize=9)
+            axes[1].grid(True)
+            axes[1].legend()
+        fig.tight_layout()
+        fig.savefig(args.plot, dpi=120)
         print(f"saved plot to {args.plot}")
 
 

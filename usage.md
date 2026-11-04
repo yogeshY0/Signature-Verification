@@ -26,6 +26,7 @@ data/raw/cedar/full_org/        genuine signatures
 data/raw/cedar/full_forg/       forgeries
 data/raw/BHSig260/BHSig100_Bengali/{Genuine,Forged}/
 data/raw/BHSig260/BHSig160_Hindi/{Genuine,Forged}/
+data/raw/SOHI/P001/{Genuine,Forged}/ ... P123   (Bengali, 16 + 16 per signer)
 ```
 
 `data/` and `checkpoints/` are Git-ignored.
@@ -34,7 +35,7 @@ data/raw/BHSig260/BHSig160_Hindi/{Genuine,Forged}/
 
 Each dataset has its own signer-disjoint split in `data/manifests/<name>.csv`, and all of
 them are merged into `data/manifest.csv`. The CEDAR manifest (`data/manifests/cedar.csv`)
-already exists. This command writes the BHSig260 one and merges everything:
+already exists. This command writes the BHSig260 and SOHI ones and merges everything:
 
 ```bash
 .venv/bin/python -m preprocessing.build_manifests
@@ -92,7 +93,9 @@ unfreezes the last two stages. Augmentation is on by default for the training sp
 | `--no-pretrained` | off | Random weights instead of ImageNet (smoke tests only) |
 
 The best checkpoint (by validation EER by default) is saved as `<output-dir>/best_model.pt`.
-One JSON line per epoch is printed, including `lr` and `validation_eer_skilled`. Computing
+One JSON line per epoch is printed, including `lr`, `validation_eer_skilled` and
+`validation_accuracy_skilled` (accuracy at each `--accuracy-thresholds` value, default
+`0.7 0.8 0.9`). Computing
 the EER adds a few seconds per epoch on a GPU. Because the checkpoint and the evaluation
 threshold are both chosen on the validation signers, the validation EER is slightly optimistic;
 trust the test numbers.
@@ -123,7 +126,9 @@ Save the printed epoch lines (or the Kaggle log export) to `training_log.txt`:
 
 It prints loss per epoch and says whether validation loss is still falling (train longer),
 or training loss falls while validation rises (overfitting). If the log holds several runs,
-it analyzes the last one.
+it analyzes the last one. The plot has two panels: train/validation loss, and validation
+accuracy per epoch, one line per threshold (needs a log from a run that printed
+`validation_accuracy_skilled`).
 
 ## 7. Evaluate on the held-out test signers
 
@@ -142,6 +147,13 @@ Bengali, Hindi separately; random negatives come from the same dataset only), an
 number of resamples (default 1000, `0` disables). Evaluation takes several minutes on CPU.
 Each signer is enrolled with the first 5 genuine signatures (`--references` changes this).
 Add `--device cpu` if there is no GPU.
+
+`--threshold 0.9` applies a fixed similarity threshold instead of the validation EER point
+(the output's `threshold_used` and `threshold_source` show which was applied). A threshold
+picked by looking at test results is not an honest estimate; choose it on validation.
+`accuracy_skilled` is correct decisions divided by all decisions over genuine and
+skilled-forgery queries (random pairs excluded). `balanced_accuracy_skilled` is the mean of
+the genuine-accept rate and the skilled-forgery reject rate at that threshold.
 
 ## 8. Compare your own signature images
 
