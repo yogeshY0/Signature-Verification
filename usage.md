@@ -44,6 +44,27 @@ already exists. This command writes the BHSig260 and SOHI ones and merges everyt
 Manifest columns: `image_path,signer_id,is_forgery,split`. A signer belongs to exactly
 one split. Forgeries carry the ID of the signer they imitate.
 
+### Augmenting CEDAR (optional)
+
+Only CEDAR is augmented, with three mild, geometry-preserving operations: stroke-thickness
+jitter (dilation/erosion), small spatial shifts, and a very light elastic deformation.
+Rotation, shear, and scaling are deliberately **not** used, because tilting or stretching a
+signature changes its spatial geometry and stroke orientation and introduces unrealistic
+artifacts. Only **train**-split signers are augmented; validation and test signers stay
+pristine. Augmented raw images sit next to their originals as
+`augmented_<type>_<variant>_<original>.png`.
+
+```bash
+# Writes the augmented raw images and refreshes data/manifests/cedar.csv + data/manifest.csv.
+.venv/bin/python -m preprocessing.augment_cedar
+
+# Preprocess CEDAR (originals + augmented) and refresh data/processed/manifest.csv.
+# --prune drops stale CEDAR PNGs; BHSig260 and SOHI are preserved as-is.
+.venv/bin/python -m preprocessing.preprocess_dataset \
+  --manifest data/manifest.csv --output-dir data/processed \
+  --datasets cedar --prune
+```
+
 ## 3. Preprocess once
 
 Writes 192x384 black-and-white PNGs to `data/processed/` and a matching
@@ -56,6 +77,11 @@ Writes 192x384 black-and-white PNGs to `data/processed/` and a matching
 
 Add `--grayscale` to keep grayscale strokes instead. Training and later comparison must
 use the same mode. Skipped images (no ink found) are listed at the end of the run.
+
+Add `--datasets <name>[,<name>...]` to (re)process only those dataset folders; every other
+dataset already present in `data/processed/manifest.csv` is copied over unchanged, so no
+other dataset is reprocessed. Combine it with `--prune` to delete stale PNGs left inside the
+processed dataset folders.
 
 ## 4. Smoke test (optional, about 2 minutes)
 

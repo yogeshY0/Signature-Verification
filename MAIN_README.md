@@ -147,6 +147,26 @@ are erased, and small stray marks far from the writing are ignored when locating
 signature box, so they do not shrink the signature. Nearby dots such as i-dots are kept.
 Training and inference must use matching preprocessing.
 
+#### CEDAR-only augmentation
+
+CEDAR (and only CEDAR) is augmented before preprocessing with three mild,
+geometry-preserving operations in `preprocessing/augment_cedar.py`: stroke-thickness jitter
+(dilation/erosion), small spatial shifts, and a very light elastic deformation. Rotation,
+shear, and scaling are deliberately **not** used, because they change a signature's spatial
+geometry and stroke orientation and introduce unrealistic artifacts. Only train-split signers
+are augmented; validation and test signers stay pristine. Augmented raw images are written
+beside their originals as `augmented_<type>_<variant>_<original>.png`:
+
+```bash
+python -m preprocessing.augment_cedar
+python -m preprocessing.preprocess_dataset --manifest data/manifest.csv \
+  --output-dir data/processed --datasets cedar --prune
+```
+
+`--datasets cedar` re-preprocesses only CEDAR (originals + augmented) and preserves the
+BHSig260 and SOHI rows of `data/processed/manifest.csv` as-is; `--prune` removes stale CEDAR
+PNGs.
+
 ## Train
 
 From the activated environment:
