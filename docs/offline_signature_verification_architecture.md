@@ -158,6 +158,8 @@ Training uses **signer-balanced batches** from which triplets are mined online (
 
 **PK batch sampler:** Each batch holds `P` signers, with `K` genuine signatures and up to `F` skilled forgeries per signer. A starting point is `P = 12`, `K = 4`, `F = 2` (72 images); tune to GPU memory. Every anchor then has at least `K - 1` positives and many negatives in the batch, which hard mining requires.
 
+**Dataset-balanced sampling:** Signers are grouped by their source dataset (e.g. `dataset_to_signers = {"CEDAR": [...], "BHSig": [...], "SOHI": [...]}`) and the per-batch signer budget `P` is split across the active datasets (equal weights by default, or `dataset_weights`). Without this, a large dataset (e.g. BHSig260, ~14k images) fills nearly every batch and starves a small one (e.g. CEDAR, ~2.6k images) of the gradient that online batch-hard mining supplies. The image budget `P * (K + F)` is unchanged; only the composition is balanced.
+
 Split data by signer and, where possible, by acquisition session. This helps avoid leakage between training and evaluation sets and better measures generalization to unseen samples. See Section 5 for the full evaluation protocol.
 
 ### Loss function

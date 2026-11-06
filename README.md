@@ -63,7 +63,11 @@ python -m training.train_siamese \
 Defaults follow the plan: 5 frozen-backbone warm-up epochs with semi-hard
 mining, then 20 epochs with the final two backbone stages unfrozen and
 batch-hard mining. The default batch uses 12 signers, 4 genuine samples per
-signer, and up to 2 skilled forgeries per signer. Adjust batch size and epoch
+signer, and up to 2 skilled forgeries per signer. Signers are grouped by source
+dataset and those 12 signers are split across the active datasets (equal weights
+by default, or `--dataset-weights CEDAR=1 BHSig=1 SOHI=1`), so a large dataset
+such as BHSig260 cannot dominate every batch and starve a small one such as
+CEDAR of gradient. Adjust batch size and epoch
 counts for available data and hardware. Checkpoints are selected by
 signer-disjoint validation loss (always computed with batch-hard mining so
 warm-up and fine-tune losses are comparable) and written to `checkpoints/stage3/best_model.pt`.

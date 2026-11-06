@@ -112,6 +112,7 @@ unfreezes the last two stages. Augmentation is on by default for the training sp
 | `--signers-per-batch` | 12 | Signers per batch; lower it if the GPU runs out of memory |
 | `--genuine-per-signer` | 4 | Genuine signatures per signer in a batch |
 | `--forgeries-per-signer` | 2 | Forgeries per signer in a batch |
+| `--dataset-weights` | equal | Per-dataset signer weight for balanced batches, e.g. `CEDAR=1 BHSig=1 SOHI=1`; `0` excludes a dataset |
 | `--margin` | 0.3 | Triplet-loss margin |
 | `--augment` | off | Turn augmentation on (it raised skilled EER from about 12% to about 16% in our runs) |
 | `--select-by` | eer | Pick the saved checkpoint by validation skilled EER (`eer`) or validation loss (`loss`) |

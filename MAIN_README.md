@@ -65,6 +65,13 @@ signatures are anchors and positives. Genuine signatures from other signers
 and skilled forgeries of the same signer are negatives; forgeries are never
 anchors or positives.
 
+Signers are grouped by source dataset and `P` is split across the active
+datasets (equal by default, or `--dataset-weights CEDAR=1 BHSig=1 SOHI=1`) so a
+large dataset cannot crowd a small one out of every batch. This matters because
+online batch-hard mining only updates the datasets that appear in a batch: with
+global random sampling BHSig260 (~14k images) would dominate and starve CEDAR
+(~2.6k images), depressing CEDAR validation accuracy.
+
 The loss computes pairwise Euclidean distances over normalized embeddings.
 Warm-up uses semi-hard negative mining; fine-tuning uses batch-hard mining.
 The training output reports loss, mean selected positive and negative

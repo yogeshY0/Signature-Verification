@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Literal, Sequence
+from typing import Callable, Iterator, Literal, Mapping, Sequence
 
 import cv2
 import timm
@@ -23,6 +24,84 @@ from preprocessing.signature_preprocessing import (
 )
 
 MiningMode = Literal["semi-hard", "batch-hard"]
+
+# Signer ids are prefixed by their source dataset when manifests are built (see
+# preprocessing/build_manifests.py): "cedar_007", "bhsig_bn_003", "bhsig_hi_012",
+# "sohi_042". Grouping signers by this prefix lets the sampler balance each batch
+# across datasets so a large dataset (e.g. BHSig260, ~14k images) cannot crowd out
+# a small one (e.g. CEDAR, ~2.6k images) and starve it of gradient updates.
+DATASET_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("cedar", "CEDAR"),
+    ("bhsig", "BHSig"),
+    ("sohi", "SOHI"),
+)
+# Bucket for signer ids that do not carry a known dataset prefix.
+OTHER_DATASET = "OTHER"
+
+
+def dataset_for_signer(signer_id: str) -> str:
+    """Return the source dataset for a signer id from its manifest prefix.
+
+    ``"cedar_007" -> "CEDAR"``, ``"bhsig_bn_003"`` and ``"bhsig_hi_012" -> "BHSig"``,
+    ``"sohi_042" -> "SOHI"``. Ids without a known prefix fall back to ``OTHER`` so
+    datasets that do not follow the convention still train as one balanced group.
+    """
+    normalized = signer_id.strip().lower()
+    for prefix, dataset in DATASET_PREFIXES:
+        if normalized == prefix or normalized.startswith(f"{prefix}_"):
+            return dataset
+    return OTHER_DATASET
+
+
+def _allocate_signers(
+    available: Mapping[str, int],
+    weights: Mapping[str, float] | None,
+    total: int,
+) -> dict[str, int]:
+    """Split ``total`` per-batch signer slots across datasets by weight.
+
+    Uses largest-remainder rounding so the integer allocations sum to
+    ``min(total, sum(available.values()))``. Datasets are weighted by ``weights``
+    (missing entries default to equal weight, zero or negative weights exclude the
+    dataset). Allocations never exceed a dataset's available signer count, and any
+    surplus is redistributed to datasets that still have spare capacity.
+    """
+    if total <= 0:
+        return {}
+    weights = weights or {}
+
+    def weight_of(dataset: str) -> float:
+        value = float(weights.get(dataset, 1.0))
+        return value if value > 0 else 0.0
+
+    active = {
+        dataset: count
+        for dataset, count in available.items()
+        if count > 0 and weight_of(dataset) > 0
+    }
+    if not active:
+        return {}
+
+    total_weight = sum(weight_of(dataset) for dataset in active)
+    target = min(total, sum(active.values()))
+    counts: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+    for dataset, count in active.items():
+        quota = target * weight_of(dataset) / total_weight
+        counts[dataset] = min(int(quota), count)
+        remainders.append((quota - int(quota), dataset))
+
+    remaining = target - sum(counts.values())
+    # Hand out leftover slots to the largest fractional quotas that still fit.
+    for _, dataset in sorted(remainders, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        spare = active[dataset] - counts[dataset]
+        if spare > 0:
+            added = min(spare, remaining)
+            counts[dataset] += added
+            remaining -= added
+    return {dataset: count for dataset, count in counts.items() if count > 0}
 
 
 @dataclass(frozen=True)
@@ -165,8 +244,16 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
 class PKBatchSampler(Sampler[list[int]]):
     """Build batches with P signers, K genuine samples, and up to F forgeries each.
 
-    P and K provide genuine positive pairs across distinct identities. Forgeries
-    are sampled only as optional negatives associated with their imitated signer.
+    Signers are grouped by their source dataset and the per-batch signer budget
+    ``P`` is split across the active datasets (equal weights by default, or
+    ``dataset_weights``) instead of being sampled globally. This is
+    dataset-balanced PK sampling: it stops a large dataset (e.g. BHSig260) from
+    dominating every batch and starving a small dataset (e.g. CEDAR) of the
+    gradient supplied by online batch-hard triplet mining. ``P`` and its image
+    budget ``P * (K + F)`` are unchanged, only the composition is balanced.
+    Within each sampled signer the standard PK structure is preserved: ``K``
+    genuine samples and up to ``F`` skilled forgeries. Forgeries are always
+    negatives associated with the signer they imitate.
     """
 
     def __init__(
@@ -177,6 +264,8 @@ class PKBatchSampler(Sampler[list[int]]):
         genuine_per_signer: int,
         forgeries_per_signer: int = 0,
         seed: int = 42,
+        dataset_weights: Mapping[str, float] | None = None,
+        dataset_resolver: Callable[[str], str] = dataset_for_signer,
     ) -> None:
         if signers_per_batch < 2:
             raise ValueError("signers_per_batch must be at least 2")
@@ -190,6 +279,8 @@ class PKBatchSampler(Sampler[list[int]]):
         self.forgeries_per_signer = forgeries_per_signer
         self.seed = seed
         self.epoch = 0
+        self.dataset_weights = dict(dataset_weights) if dataset_weights else {}
+        self.dataset_resolver = dataset_resolver
         # Keep genuine and forged record indices separate for each signer.
         self.by_signer: dict[str, dict[bool, list[int]]] = {}
         for index, record in enumerate(records):
@@ -208,9 +299,30 @@ class PKBatchSampler(Sampler[list[int]]):
                 f"{genuine_per_signer} genuine images; found {len(self.eligible_signers)}"
             )
 
+        # Map every eligible signer to its source dataset (e.g. CEDAR/BHSig/SOHI).
+        self.dataset_to_signers: dict[str, list[str]] = {}
+        for signer in self.eligible_signers:
+            self.dataset_to_signers.setdefault(self.dataset_resolver(signer), []).append(signer)
+
+        # Split the per-batch signer budget across datasets (equal weights by default).
+        self.dataset_allocation = _allocate_signers(
+            {dataset: len(signers) for dataset, signers in self.dataset_to_signers.items()},
+            self.dataset_weights,
+            self.signers_per_batch,
+        )
+        self.active_signers_per_batch = sum(self.dataset_allocation.values())
+        if self.active_signers_per_batch < 2:
+            raise ValueError(
+                "dataset_weights leave fewer than two signers to sample per batch"
+            )
+
     def __len__(self) -> int:
         # Number of batches per epoch; signers are sampled anew for each batch.
-        return max(1, (len(self.eligible_signers) + self.signers_per_batch - 1) // self.signers_per_batch)
+        return max(
+            1,
+            (len(self.eligible_signers) + self.active_signers_per_batch - 1)
+            // self.active_signers_per_batch,
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Change the deterministic sampling sequence for the next epoch."""
@@ -220,15 +332,17 @@ class PKBatchSampler(Sampler[list[int]]):
         # A local seeded RNG makes each epoch reproducible without changing global RNG.
         rng = random.Random(self.seed + self.epoch)
         for _ in range(len(self)):
-            signer_batch = rng.sample(self.eligible_signers, self.signers_per_batch)
             indices: list[int] = []
-            for signer in signer_batch:
-                groups = self.by_signer[signer]
-                indices.extend(rng.sample(groups[False], self.genuine_per_signer))
-                # Not every signer has forgeries; use all available up to the cap.
-                forgery_count = min(self.forgeries_per_signer, len(groups[True]))
-                if forgery_count:
-                    indices.extend(rng.sample(groups[True], forgery_count))
+            # Draw each dataset's signer quota so no single dataset dominates the batch.
+            for dataset, count in self.dataset_allocation.items():
+                signer_batch = rng.sample(self.dataset_to_signers[dataset], count)
+                for signer in signer_batch:
+                    groups = self.by_signer[signer]
+                    indices.extend(rng.sample(groups[False], self.genuine_per_signer))
+                    # Not every signer has forgeries; use all available up to the cap.
+                    forgery_count = min(self.forgeries_per_signer, len(groups[True]))
+                    if forgery_count:
+                        indices.extend(rng.sample(groups[True], forgery_count))
             yield indices
 
 

@@ -32,6 +32,33 @@ def _device_from_argument(value: str) -> torch.device:
     return torch.device("cpu")
 
 
+def _parse_dataset_weights(items: list[str] | None) -> dict[str, float]:
+    """Parse ``DATASET=WEIGHT`` CLI entries into a weight mapping.
+
+    Negative weights are rejected and entries without ``=`` are reported clearly
+    so a typo cannot silently fall back to equal weighting.
+    """
+    weights: dict[str, float] = {}
+    for item in items or []:
+        name, separator, value = item.partition("=")
+        if not separator or not name.strip():
+            raise ValueError(
+                f"--dataset-weights entries must look like DATASET=WEIGHT, got {item!r}"
+            )
+        try:
+            weight = float(value)
+        except ValueError as error:
+            raise ValueError(
+                f"--dataset-weights weight for {name.strip()!r} is not a number: {value!r}"
+            ) from error
+        if weight < 0:
+            raise ValueError(
+                f"--dataset-weights weight for {name.strip()!r} cannot be negative"
+            )
+        weights[name.strip()] = weight
+    return weights
+
+
 def _run_epoch(
     model: SiameseSignatureModel,
     loader: DataLoader,
@@ -144,6 +171,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--signers-per-batch", type=int, default=12)
     parser.add_argument("--genuine-per-signer", type=int, default=4)
     parser.add_argument("--forgeries-per-signer", type=int, default=2)
+    parser.add_argument(
+        "--dataset-weights",
+        nargs="*",
+        default=None,
+        metavar="DATASET=WEIGHT",
+        help=(
+            "Per-dataset signer weight for dataset-balanced PK sampling, e.g. "
+            "CEDAR=1 BHSig=1 SOHI=1. Datasets are matched by signer-id prefix. "
+            "Omitted datasets default to equal weight; a weight of 0 excludes a "
+            "dataset. Default: equal weight for every active dataset."
+        ),
+    )
     parser.add_argument("--margin", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -167,6 +206,7 @@ def main() -> None:
         raise ValueError("workers cannot be negative")
     if args.margin <= 0:
         raise ValueError("margin must be positive")
+    dataset_weights = _parse_dataset_weights(args.dataset_weights)
 
     _set_seed(args.seed)
     train_records, validation_records = load_manifest(args.manifest, args.image_root)
@@ -195,6 +235,13 @@ def main() -> None:
         genuine_per_signer=args.genuine_per_signer,
         forgeries_per_signer=args.forgeries_per_signer,
         seed=args.seed,
+        dataset_weights=dataset_weights,
+    )
+    # Report the dataset-balanced batch composition so runs are easy to compare.
+    print(
+        "Dataset-balanced sampling | signers/dataset: "
+        f"{ {dataset: len(signers) for dataset, signers in train_sampler.dataset_to_signers.items()} }"
+        f" -> signers per batch: {train_sampler.dataset_allocation}"
     )
     validation_eligible_signers = {
         record.signer_id
@@ -220,6 +267,7 @@ def main() -> None:
         genuine_per_signer=2,
         forgeries_per_signer=args.forgeries_per_signer,
         seed=args.seed,
+        dataset_weights=dataset_weights,
     )
 
     train_loader = DataLoader(

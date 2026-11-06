@@ -10,9 +10,11 @@ from pathlib import Path
 import torch
 
 from training.stage3_metric_learning import (
+    OTHER_DATASET,
     PKBatchSampler,
     SiameseSignatureModel,
     SignatureRecord,
+    dataset_for_signer,
     load_manifest,
     triplet_loss,
 )
@@ -101,6 +103,84 @@ class PKBatchSamplerTests(unittest.TestCase):
         records = [SignatureRecord(Path("a.png"), "a", False)]
         with self.assertRaisesRegex(ValueError, "need at least"):
             PKBatchSampler(records, signers_per_batch=2, genuine_per_signer=2)
+
+
+class DatasetBalancedSamplingTests(unittest.TestCase):
+    @staticmethod
+    def _signer_records(signers: list[str], *, genuine: int = 3, forgeries: int = 1):
+        records = []
+        for signer in signers:
+            for index in range(genuine):
+                records.append(SignatureRecord(Path(f"{signer}-{index}.png"), signer, False))
+            for index in range(forgeries):
+                records.append(SignatureRecord(Path(f"{signer}-forgery-{index}.png"), signer, True))
+        return records
+
+    def test_maps_signers_to_source_datasets(self) -> None:
+        self.assertEqual(dataset_for_signer("cedar_007"), "CEDAR")
+        self.assertEqual(dataset_for_signer("bhsig_bn_003"), "BHSig")
+        self.assertEqual(dataset_for_signer("bhsig_hi_012"), "BHSig")
+        self.assertEqual(dataset_for_signer("sohi_042"), "SOHI")
+        self.assertEqual(dataset_for_signer("unknown_signer"), OTHER_DATASET)
+
+    def test_equal_weights_split_signers_evenly_across_datasets(self) -> None:
+        signers = {
+            "CEDAR": ["cedar_001", "cedar_002"],
+            "BHSig": ["bhsig_bn_001", "bhsig_hi_002"],
+            "SOHI": ["sohi_001", "sohi_002"],
+        }
+        records = [
+            record
+            for dataset_signers in signers.values()
+            for record in self._signer_records(dataset_signers, forgeries=1)
+        ]
+        sampler = PKBatchSampler(
+            records, signers_per_batch=6, genuine_per_signer=2, forgeries_per_signer=1, seed=3
+        )
+        # Six signers split evenly across the three datasets.
+        self.assertEqual(sampler.dataset_allocation, {"CEDAR": 2, "BHSig": 2, "SOHI": 2})
+
+        batch = next(iter(sampler))
+        selected = [records[index] for index in batch]
+        # Each dataset contributes exactly its two signers, with K genuine + F forgery.
+        self.assertEqual(len(batch), 6 * 3)
+        for dataset_signers in signers.values():
+            drawn = [record for record in selected if record.signer_id in dataset_signers]
+            self.assertEqual({record.signer_id for record in drawn}, set(dataset_signers))
+            self.assertEqual(sum(not record.is_forgery for record in drawn), 2 * 2)
+            self.assertEqual(sum(record.is_forgery for record in drawn), 2 * 1)
+
+    def test_dataset_weights_bias_the_allocation(self) -> None:
+        records = self._signer_records(
+            ["cedar_001", "cedar_002", "cedar_003", "cedar_004"]
+        ) + self._signer_records(["bhsig_bn_001", "bhsig_bn_002"])
+        sampler = PKBatchSampler(
+            records,
+            signers_per_batch=4,
+            genuine_per_signer=2,
+            dataset_weights={"CEDAR": 3, "BHSig": 1, "SOHI": 0},
+            seed=5,
+        )
+        # 3:1 weights across four slots give CEDAR three signers and BHSig one.
+        self.assertEqual(sampler.dataset_allocation, {"CEDAR": 3, "BHSig": 1})
+
+    def test_allocation_is_capped_by_availability(self) -> None:
+        # Equal weights would give CEDAR two slots, but only one signer exists, so
+        # the surplus moves to BHSig which still has capacity.
+        records = self._signer_records(["cedar_001"]) + self._signer_records(
+            ["bhsig_bn_001", "bhsig_bn_002", "bhsig_bn_003", "bhsig_bn_004"]
+        )
+        sampler = PKBatchSampler(records, signers_per_batch=4, genuine_per_signer=2, seed=1)
+        self.assertEqual(sampler.dataset_allocation, {"CEDAR": 1, "BHSig": 3})
+
+    def test_unprefixed_signers_share_one_balanced_group(self) -> None:
+        # Signers without a dataset prefix stay in a single OTHER group, so the
+        # sampler behaves like the original global sampler for legacy manifests.
+        records = self._signer_records(["a", "b", "c", "d"])
+        sampler = PKBatchSampler(records, signers_per_batch=2, genuine_per_signer=2, seed=1)
+        self.assertEqual(list(sampler.dataset_to_signers), [OTHER_DATASET])
+        self.assertEqual(sampler.dataset_allocation, {OTHER_DATASET: 2})
+        self.assertEqual(len(next(iter(sampler))), 2 * 2)
 
 
 class TripletLossTests(unittest.TestCase):
