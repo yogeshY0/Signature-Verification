@@ -7,3 +7,4 @@ checkpoints/
 best_model.pt
 training_curve/
 training_log.txt
+sigver_raw.zip

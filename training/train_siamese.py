@@ -14,7 +14,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
-from training.evaluate import _accuracy, _embed, _eer_threshold, _pool, _scores
+from training.evaluate import (
+    _accuracy,
+    _choose_negatives,
+    _embed,
+    _eer_threshold,
+    _pool,
+    _scores,
+)
 from training.stage3_metric_learning import (
     PKBatchSampler,
     SignatureDataset,
@@ -113,19 +120,34 @@ def _validation_eer(
     *,
     already_preprocessed: bool,
     device: torch.device,
+    resize_only: bool = False,
+    resize_mode: str = "aspect",
+    negatives: str = "auto",
     references: int = 5,
     thresholds: tuple[float, ...] = (),
 ) -> tuple[float, dict[str, float]]:
-    """Skilled-forgery EER and accuracy at fixed thresholds on validation signers.
+    """Validation EER and accuracy at fixed thresholds on validation signers.
 
-    Uses the same protocol as evaluate.py. Accuracy counts genuine and skilled-forgery
-    queries only.
+    Uses the same protocol as evaluate.py. ``negatives`` selects the negative score
+    set: skilled forgeries, random (different-signer) pairs, or ``auto`` (forgeries
+    when present, otherwise random). Accuracy counts genuine and the selected
+    negatives, so a genuine-only dataset can still be scored.
     """
-    embeddings = _embed(model, records, already_preprocessed, device, 64, 0)
+    embeddings = _embed(
+        model,
+        records,
+        already_preprocessed,
+        device,
+        64,
+        0,
+        resize_only=resize_only,
+        resize_mode=resize_mode,
+    )
     scores = _scores(records, embeddings, references)
-    genuine, skilled, _ = _pool(scores, sorted(scores))
-    accuracy = {f"{t:g}": _accuracy(genuine, skilled, t) for t in thresholds}
-    return _eer_threshold(genuine, skilled)[1], accuracy
+    genuine, skilled, random = _pool(scores, sorted(scores))
+    negative_scores = _choose_negatives(genuine, skilled, random, negatives)
+    accuracy = {f"{t:g}": _accuracy(genuine, negative_scores, t) for t in thresholds}
+    return _eer_threshold(genuine, negative_scores)[1], accuracy
 
 
 def _set_seed(seed: int) -> None:
@@ -147,6 +169,34 @@ def _parse_args() -> argparse.Namespace:
         "--already-preprocessed",
         action="store_true",
         help="Input files are already 192x384 Stage 2 output images",
+    )
+    parser.add_argument(
+        "--resize-only",
+        action="store_true",
+        help="Feed raw images directly (no Stage 2.2 preprocessing): read any "
+        "size/channel count, convert to grayscale, resize to 192x384, normalize.",
+    )
+    parser.add_argument(
+        "--crop-grayscale",
+        action="store_true",
+        help="Add the ink-crop step but keep grayscale: read raw images, convert to "
+        "grayscale, crop to the ink box, resize to 192x384. No background whitening "
+        "and no binarization, so the output is not black-and-white.",
+    )
+    parser.add_argument(
+        "--resize-mode",
+        choices=("aspect", "stretch"),
+        default="aspect",
+        help="Resize strategy for --resize-only: 'aspect' preserves the aspect ratio and "
+        "pads with white; 'stretch' forces the image to 192x384.",
+    )
+    parser.add_argument(
+        "--negatives",
+        choices=("auto", "skilled", "random"),
+        default="auto",
+        help="Negative set for validation EER/accuracy: 'skilled' forgeries, 'random' "
+        "genuine signatures of other signers, or 'auto' (forgeries when present, else "
+        "random). Genuine-only datasets need 'auto' or 'random'.",
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument(
@@ -219,6 +269,9 @@ def main() -> None:
         train_records,
         signer_to_index,
         already_preprocessed=args.already_preprocessed,
+        resize_only=args.resize_only,
+        crop_only=args.crop_grayscale,
+        resize_mode=args.resize_mode,
         ink=args.ink,
         augment=args.augment,
     )
@@ -226,6 +279,9 @@ def main() -> None:
         validation_records,
         signer_to_index,
         already_preprocessed=args.already_preprocessed,
+        resize_only=args.resize_only,
+        crop_only=args.crop_grayscale,
+        resize_mode=args.resize_mode,
         ink=args.ink,
     )
 
@@ -353,6 +409,9 @@ def main() -> None:
                 model,
                 eer_records,
                 already_preprocessed=args.already_preprocessed,
+                resize_only=args.resize_only,
+                resize_mode=args.resize_mode,
+                negatives=args.negatives,
                 device=device,
                 thresholds=tuple(args.accuracy_thresholds),
             ) if eer_records else (math.nan, {})
@@ -388,6 +447,10 @@ def main() -> None:
                         "seed": args.seed,
                         "preprocessing": {
                             "already_preprocessed": args.already_preprocessed,
+                            "resize_only": args.resize_only,
+                            "crop_only": args.crop_grayscale,
+                            "resize_mode": args.resize_mode,
+                            "negatives": args.negatives,
                             "ink": args.ink,
                             "augmentation": args.augment,
                             "target_size": list(DEFAULT_TARGET_SIZE),

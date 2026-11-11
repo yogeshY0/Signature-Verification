@@ -19,11 +19,15 @@ from torch.utils.data import Dataset, Sampler
 from preprocessing.augmentation import augment_signature
 from preprocessing.signature_preprocessing import (
     DEFAULT_TARGET_SIZE,
+    aspect_aware_resize,
+    crop_to_ink,
     preprocess_signature,
     to_model_input,
 )
 
 MiningMode = Literal["semi-hard", "batch-hard"]
+# How raw images are brought to the model's fixed input size in ``resize_only`` mode.
+ResizeMode = Literal["aspect", "stretch"]
 
 # Signer ids are prefixed by their source dataset when manifests are built (see
 # preprocessing/build_manifests.py): "cedar_007", "bhsig_bn_003", "bhsig_hi_012",
@@ -193,7 +197,19 @@ def load_manifest(
 
 
 class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
-    """Load signatures, preprocess them, and return model-ready tensors and labels."""
+    """Load signatures, preprocess them, and return model-ready tensors and labels.
+
+    Four input modes are supported:
+    * default: read the raw crop and run the Stage 2.2 ``preprocess_signature`` path.
+    * ``already_preprocessed``: the files are Stage 2.2 output (192x384 grayscale).
+    * ``resize_only``: the files are treated as already-prepared signatures and fed to
+      the network as-is. The image is read at any size/channel count, converted to
+      grayscale and resized to the model input, with no Stage 2.2 crop, background
+      whitening or binarization.
+    * ``crop_only``: add the ink-crop step on top of the raw grayscale image (crop to
+      the ink bounding box, then resize). No background whitening and no binarization,
+      so stroke intensity is preserved and the output is not black-and-white.
+    """
 
     def __init__(
         self,
@@ -201,37 +217,96 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
         signer_to_index: dict[str, int],
         *,
         already_preprocessed: bool = False,
+        resize_only: bool = False,
+        crop_only: bool = False,
+        resize_mode: ResizeMode = "aspect",
         ink: Literal["auto", "light", "dark"] = "auto",
         augment: bool = False,
     ) -> None:
+        inputs = {
+            "already_preprocessed": already_preprocessed,
+            "resize_only": resize_only,
+            "crop_only": crop_only,
+        }
+        enabled = [name for name, on in inputs.items() if on]
+        if len(enabled) > 1:
+            raise ValueError(f"{' and '.join(enabled)} are mutually exclusive")
+        if resize_mode not in {"aspect", "stretch"}:
+            raise ValueError(f"unsupported resize_mode: {resize_mode}")
         self.records = list(records)
         # Augmentation is for the training split only; evaluation data stays untouched.
         self.augment = augment
         self.signer_to_index = signer_to_index
         self.already_preprocessed = already_preprocessed
+        self.resize_only = resize_only
+        self.crop_only = crop_only
+        self.resize_mode = resize_mode
         self.ink = ink
 
     def __len__(self) -> int:
         return len(self.records)
 
+    def _read_resized(self, path: Path) -> np.ndarray:
+        """Read any signature image and resize it to the model input size.
+
+        The Stage 2.2 pipeline is skipped entirely: no ink crop, background whitening
+        or binarization. Only a grayscale conversion and a resize to
+        ``DEFAULT_TARGET_SIZE`` happen, so the raw image can be fed to the network.
+        """
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError(f"could not read signature image: {path}")
+        grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        width, height = DEFAULT_TARGET_SIZE
+        if self.resize_mode == "stretch":
+            return cv2.resize(grayscale, (width, height), interpolation=cv2.INTER_AREA)
+        # Preserve the aspect ratio and pad with white, matching the model's input.
+        return aspect_aware_resize(grayscale, DEFAULT_TARGET_SIZE, pad_value=255)
+
+    def _read_cropped(self, path: Path) -> np.ndarray:
+        """Grayscale + crop to the ink box + resize (no whitening, no binarization).
+
+        This adds only the Stage 2.2 ink-crop step on top of the raw grayscale image.
+        Strokes keep their original intensity and the paper background is not whitened,
+        so the result stays grayscale rather than black-and-white.
+        """
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError(f"could not read signature image: {path}")
+        grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        try:
+            cropped = crop_to_ink(grayscale, margin=0.05)
+        except ValueError:
+            # Faint/blank scan: keep the whole frame instead of crashing the run.
+            cropped = grayscale
+        width, height = DEFAULT_TARGET_SIZE
+        if self.resize_mode == "stretch":
+            return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_AREA)
+        return aspect_aware_resize(cropped, DEFAULT_TARGET_SIZE, pad_value=255)
+
     def __getitem__(self, index: int) -> tuple[Tensor, int, bool]:
         record = self.records[index]
-        # Already-preprocessed files are grayscale at the model's fixed input size.
-        read_mode = cv2.IMREAD_GRAYSCALE if self.already_preprocessed else cv2.IMREAD_COLOR
-        image = cv2.imread(str(record.image_path), read_mode)
-        if image is None:
-            raise FileNotFoundError(f"could not read signature image: {record.image_path}")
-
-        if self.already_preprocessed:
-            expected_shape = (DEFAULT_TARGET_SIZE[1], DEFAULT_TARGET_SIZE[0])
-            if image.shape != expected_shape:
-                raise ValueError(
-                    f"preprocessed image {record.image_path} has shape {image.shape}; "
-                    f"expected {expected_shape}"
-                )
-            preprocessed = image
+        if self.resize_only:
+            preprocessed = self._read_resized(record.image_path)
+        elif self.crop_only:
+            preprocessed = self._read_cropped(record.image_path)
         else:
-            preprocessed = preprocess_signature(image, ink=self.ink)
+            # Already-preprocessed files are grayscale at the model's fixed input size.
+            read_mode = cv2.IMREAD_GRAYSCALE if self.already_preprocessed else cv2.IMREAD_COLOR
+            image = cv2.imread(str(record.image_path), read_mode)
+            if image is None:
+                raise FileNotFoundError(f"could not read signature image: {record.image_path}")
+
+            if self.already_preprocessed:
+                expected_shape = (DEFAULT_TARGET_SIZE[1], DEFAULT_TARGET_SIZE[0])
+                if image.shape != expected_shape:
+                    raise ValueError(
+                        f"preprocessed image {record.image_path} has shape {image.shape}; "
+                        f"expected {expected_shape}"
+                    )
+                preprocessed = image
+            else:
+                preprocessed = preprocess_signature(image, ink=self.ink)
 
         if self.augment:
             preprocessed = augment_signature(preprocessed)

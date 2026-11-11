@@ -57,9 +57,25 @@ def _read_split(manifest: Path, root: Path, splits: set[str]) -> list[SignatureR
 
 
 @torch.no_grad()
-def _embed(model, records, already_preprocessed, device, batch_size, workers) -> np.ndarray:
+def _embed(
+    model,
+    records,
+    already_preprocessed,
+    device,
+    batch_size,
+    workers,
+    *,
+    resize_only: bool = False,
+    crop_only: bool = False,
+    resize_mode: str = "aspect",
+) -> np.ndarray:
     dataset = SignatureDataset(
-        records, {r.signer_id: 0 for r in records}, already_preprocessed=already_preprocessed
+        records,
+        {r.signer_id: 0 for r in records},
+        already_preprocessed=already_preprocessed,
+        resize_only=resize_only,
+        crop_only=crop_only,
+        resize_mode=resize_mode,  # type: ignore[arg-type]
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
     model.eval()
@@ -121,19 +137,29 @@ def _pool(scores, signers, dataset_only: bool = False):
 
 
 def _rates(genuine, negatives, threshold):
-    frr = float((genuine < threshold).mean())
-    far = float((negatives >= threshold).mean())
+    """Return (FAR, FRR) at ``threshold``; ``nan`` when a side has no scores."""
+    frr = float((genuine < threshold).mean()) if len(genuine) else float("nan")
+    far = float((negatives >= threshold).mean()) if len(negatives) else float("nan")
     return far, frr
 
 
-def _accuracy(genuine, skilled, threshold) -> float:
-    """Correct decisions / all decisions over genuine and skilled-forgery queries only."""
-    correct = (genuine >= threshold).sum() + (skilled < threshold).sum()
-    return float(correct / (len(genuine) + len(skilled)))
+def _accuracy(genuine, negatives, threshold) -> float:
+    """Correct decisions / all decisions over genuine and negative queries only."""
+    total = len(genuine) + len(negatives)
+    if total == 0:
+        return float("nan")
+    correct = (genuine >= threshold).sum() + (negatives < threshold).sum()
+    return float(correct / total)
 
 
 def _eer_threshold(genuine, negatives):
-    """Threshold where FAR and FRR are closest, and the EER there (sort-based, O(n log n))."""
+    """Threshold where FAR and FRR are closest, and the EER there (sort-based, O(n log n)).
+
+    Returns ``(nan, nan)`` when either side is empty (e.g. a genuine-only dataset with
+    no forgeries), so callers can fall back to another negative set.
+    """
+    if len(genuine) == 0 or len(negatives) == 0:
+        return float("nan"), float("nan")
     candidates = np.unique(np.concatenate([genuine, negatives]))
     gen_sorted, neg_sorted = np.sort(genuine), np.sort(negatives)
     frr = np.searchsorted(gen_sorted, candidates, side="left") / len(genuine)
@@ -142,11 +168,48 @@ def _eer_threshold(genuine, negatives):
     return float(candidates[best]), float((far[best] + frr[best]) / 2)
 
 
-def _metrics(genuine, skilled, random, threshold) -> dict[str, float]:
-    far_skilled, frr = _rates(genuine, skilled, threshold)
+def _choose_negatives(genuine, skilled, random, mode: str = "auto"):
+    """Pick the negative score set used for EER / accuracy.
+
+    ``skilled`` uses skilled forgeries, ``random`` uses genuine signatures of other
+    signers, and ``auto`` uses skilled forgeries when the evaluation set has any and
+    otherwise falls back to random pairs, so a genuine-only dataset can still be
+    scored (random forgeries).
+    """
+    if mode == "skilled":
+        return skilled
+    if mode == "random":
+        return random
+    if mode != "auto":
+        raise ValueError(f"unsupported negatives mode: {mode}")
+    return skilled if len(skilled) else random
+
+
+def _metrics(genuine, skilled, random, threshold, negatives_mode: str = "auto") -> dict[str, float]:
+    """Metrics against skilled forgeries, random pairs, or the selected negative set.
+
+    ``negatives_mode`` selects which set the headline keys (``accuracy``, ``eer``,
+    ``balanced_accuracy``, ``far_at_threshold``) use. The skilled- and random-specific
+    keys are kept for backwards compatibility and are ``nan`` when that set is empty.
+    """
+    source = negatives_mode
+    if source == "auto":
+        source = "skilled" if len(skilled) else "random"
+    if source not in {"skilled", "random"}:
+        raise ValueError(f"unsupported negatives mode: {negatives_mode}")
+    negatives = skilled if source == "skilled" else random
+
+    far_negative, frr = _rates(genuine, negatives, threshold)
+    far_skilled, _ = _rates(genuine, skilled, threshold)
     far_random, _ = _rates(genuine, random, threshold)
     return {
-        # Genuine vs skilled forgeries only (random pairs excluded).
+        # Negative set actually used, and the headline metrics against it.
+        "negatives_source": source,
+        "accuracy": _accuracy(genuine, negatives, threshold),
+        "balanced_accuracy": ((1 - frr) + (1 - far_negative)) / 2,
+        "eer": _eer_threshold(genuine, negatives)[1],
+        "far_at_threshold": far_negative,
+        # Backwards-compatible skilled / random specific metrics.
         "accuracy_skilled": _accuracy(genuine, skilled, threshold),
         "balanced_accuracy_skilled": ((1 - frr) + (1 - far_skilled)) / 2,
         "eer_skilled": _eer_threshold(genuine, skilled)[1],
@@ -157,7 +220,9 @@ def _metrics(genuine, skilled, random, threshold) -> dict[str, float]:
     }
 
 
-def _bootstrap(scores, signers, threshold, resamples, dataset_only=False, seed=0):
+def _bootstrap(
+    scores, signers, threshold, resamples, dataset_only=False, negatives_mode="auto", seed=0
+):
     """95% intervals from resampling signers with replacement."""
     if resamples <= 0:
         return None
@@ -166,23 +231,27 @@ def _bootstrap(scores, signers, threshold, resamples, dataset_only=False, seed=0
     for _ in range(resamples):
         chosen = [signers[i] for i in rng.integers(0, len(signers), len(signers))]
         genuine, skilled, random = _pool(scores, chosen, dataset_only)
-        if len(genuine) and len(skilled) and len(random):
-            draws.append(_metrics(genuine, skilled, random, threshold))
+        if len(genuine) and len(_choose_negatives(genuine, skilled, random, negatives_mode)):
+            draws.append(_metrics(genuine, skilled, random, threshold, negatives_mode))
+    if not draws:
+        return None
     return {
         key: [float(np.percentile([d[key] for d in draws], q)) for q in (2.5, 97.5)]
         for key in draws[0]
     }
 
 
-def _summary(scores, signers, threshold, resamples, dataset_only=False) -> dict:
+def _summary(scores, signers, threshold, resamples, dataset_only=False, negatives_mode="auto") -> dict:
     genuine, skilled, random = _pool(scores, signers, dataset_only)
     return {
         "signers": len(signers),
-        **_metrics(genuine, skilled, random, threshold),
+        **_metrics(genuine, skilled, random, threshold, negatives_mode),
         "genuine_queries": len(genuine),
         "skilled_forgeries": len(skilled),
         "random_pairs": len(random),
-        "confidence_95": _bootstrap(scores, signers, threshold, resamples, dataset_only),
+        "confidence_95": _bootstrap(
+            scores, signers, threshold, resamples, dataset_only, negatives_mode
+        ),
     }
 
 
@@ -192,6 +261,33 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--image-root", type=Path)
     parser.add_argument("--already-preprocessed", action="store_true")
+    parser.add_argument(
+        "--resize-only",
+        action="store_true",
+        help="Feed raw images directly: read any size/channels, grayscale, resize to "
+        "192x384 (no Stage 2.2 crop/whitening/binarization).",
+    )
+    parser.add_argument(
+        "--crop-grayscale",
+        action="store_true",
+        help="Add the ink-crop step but keep grayscale: grayscale, crop to the ink box, "
+        "resize to 192x384. No background whitening and no binarization.",
+    )
+    parser.add_argument(
+        "--resize-mode",
+        choices=("aspect", "stretch"),
+        default="aspect",
+        help="Resize strategy for --resize-only: 'aspect' preserves the aspect ratio and "
+        "pads with white; 'stretch' forces 192x384.",
+    )
+    parser.add_argument(
+        "--negatives",
+        choices=("auto", "skilled", "random"),
+        default="auto",
+        help="Negative score set for EER/accuracy: 'skilled' forgeries, 'random' genuine "
+        "signatures of other signers, or 'auto' (forgeries when present, else random). "
+        "Genuine-only datasets need 'auto' or 'random'.",
+    )
     parser.add_argument("--references", type=int, default=5)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -218,14 +314,24 @@ def main() -> None:
     for name, splits in (("val", {"val", "validation"}), ("test", {"test"})):
         records = _read_split(args.manifest, root, splits)
         embeddings = _embed(
-            model, records, args.already_preprocessed, args.device, args.batch_size, args.workers
+            model,
+            records,
+            args.already_preprocessed,
+            args.device,
+            args.batch_size,
+            args.workers,
+            resize_only=args.resize_only,
+            crop_only=args.crop_grayscale,
+            resize_mode=args.resize_mode,
         )
         results[name] = _scores(records, embeddings, args.references)
 
-    # Threshold from validation signers; "skilled" is the harder and more relevant case.
+    # Threshold from validation signers. "auto" uses skilled forgeries when the
+    # validation set has any and otherwise random (different-signer) pairs.
     val_signers = sorted(results["val"])
-    val_gen, val_skilled, _ = _pool(results["val"], val_signers)
-    eer_threshold, val_eer = _eer_threshold(val_gen, val_skilled)
+    val_gen, val_skilled, val_random = _pool(results["val"], val_signers)
+    val_negatives = _choose_negatives(val_gen, val_skilled, val_random, args.negatives)
+    eer_threshold, val_eer = _eer_threshold(val_gen, val_negatives)
     threshold = eer_threshold if args.threshold is None else args.threshold
 
     test_scores = results["test"]
@@ -237,6 +343,7 @@ def main() -> None:
             threshold,
             args.bootstrap,
             dataset_only=True,
+            negatives_mode=args.negatives,
         )
         for name in sorted({_dataset(s) for s in test_signers})
     }
@@ -244,11 +351,16 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "negatives": args.negatives,
                 "threshold_from_validation": eer_threshold,
                 "threshold_used": threshold,
                 "threshold_source": "validation_eer" if args.threshold is None else "user",
+                "validation_eer": val_eer,
+                # Kept for backwards compatibility; equals `validation_eer` above.
                 "validation_eer_skilled": val_eer,
-                "test": _summary(test_scores, test_signers, threshold, args.bootstrap),
+                "test": _summary(
+                    test_scores, test_signers, threshold, args.bootstrap, negatives_mode=args.negatives
+                ),
                 "test_per_dataset": per_dataset,
             },
             indent=2,
