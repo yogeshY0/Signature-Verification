@@ -237,7 +237,8 @@ def _bootstrap(
         return None
     return {
         key: [float(np.percentile([d[key] for d in draws], q)) for q in (2.5, 97.5)]
-        for key in draws[0]
+        for key, value in draws[0].items()
+        if isinstance(value, (int, float, np.integer, np.floating))
     }
 
 
