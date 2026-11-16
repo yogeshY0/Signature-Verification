@@ -64,18 +64,11 @@ def _embed(
     device,
     batch_size,
     workers,
-    *,
-    resize_only: bool = False,
-    crop_only: bool = False,
-    resize_mode: str = "aspect",
 ) -> np.ndarray:
     dataset = SignatureDataset(
         records,
         {r.signer_id: 0 for r in records},
         already_preprocessed=already_preprocessed,
-        resize_only=resize_only,
-        crop_only=crop_only,
-        resize_mode=resize_mode,  # type: ignore[arg-type]
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
     model.eval()
@@ -263,25 +256,6 @@ def main() -> None:
     parser.add_argument("--image-root", type=Path)
     parser.add_argument("--already-preprocessed", action="store_true")
     parser.add_argument(
-        "--resize-only",
-        action="store_true",
-        help="Feed raw images directly: read any size/channels, grayscale, resize to "
-        "192x384 (no Stage 2.2 crop/whitening/binarization).",
-    )
-    parser.add_argument(
-        "--crop-grayscale",
-        action="store_true",
-        help="Add the ink-crop step but keep grayscale: grayscale, crop to the ink box, "
-        "resize to 192x384. No background whitening and no binarization.",
-    )
-    parser.add_argument(
-        "--resize-mode",
-        choices=("aspect", "stretch"),
-        default="aspect",
-        help="Resize strategy for --resize-only: 'aspect' preserves the aspect ratio and "
-        "pads with white; 'stretch' forces 192x384.",
-    )
-    parser.add_argument(
         "--negatives",
         choices=("auto", "skilled", "random"),
         default="auto",
@@ -321,9 +295,6 @@ def main() -> None:
             args.device,
             args.batch_size,
             args.workers,
-            resize_only=args.resize_only,
-            crop_only=args.crop_grayscale,
-            resize_mode=args.resize_mode,
         )
         results[name] = _scores(records, embeddings, args.references)
 
