@@ -82,8 +82,10 @@ Defaults follow the architecture plan:
 The default batch uses 12 signers, 4 genuine signatures per signer, and up to
 2 skilled forgeries per signer. Adjust epochs, batch composition, and device
 for the dataset and available hardware. The best checkpoint is selected by
-signer-disjoint validation loss, computed with batch-hard mining in both
-phases so the values are comparable.
+default on signer-disjoint validation EER (`--select-metric eer`; `loss` and
+`auc` are also available). EER/AUC use the same reference protocol as
+`training.evaluate`; the `loss` option reproduces the earlier criterion and is
+computed with batch-hard mining in both phases so the values are comparable.
 
 ## Dataset manifest
 
@@ -143,8 +145,9 @@ python -m training.train_siamese \
 
 The script saves the best checkpoint to
 `checkpoints/stage3/best_model.pt`. The checkpoint contains model weights,
-embedding dimension, validation loss, epoch and phase, seed, and preprocessing
-settings.
+embedding dimension, the selection metric and its value, the validation metrics
+(loss, plus EER/AUC when those are selected), epoch and phase, seed, and
+preprocessing settings.
 
 Useful options:
 
@@ -162,6 +165,10 @@ Useful options:
 --margin FLOAT                    Triplet margin (default 0.3)
 --workers N                       DataLoader workers (default 0)
 --seed N                          Random seed (default 42)
+--select-metric loss|eer|auc      Checkpoint criterion (default eer)
+--select-references N             Enrolled genuines per signer for EER/AUC (default 1)
+--select-negatives auto|skilled|random   Negative set for EER/AUC (default auto)
+--select-batch-size N             Batch size for the EER/AUC pass (default 64)
 ```
 
 For example, to run a quick CPU trial without downloading ImageNet weights:

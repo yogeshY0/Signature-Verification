@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
 from training.stage3_metric_learning import (
@@ -161,6 +162,19 @@ def _eer_threshold(genuine, negatives):
     return float(candidates[best]), float((far[best] + frr[best]) / 2)
 
 
+def _roc_auc(genuine, negatives) -> float:
+    """Threshold-free separation between genuine and negative scores (ROC-AUC).
+
+    Equivalent to the probability that a genuine query outranks a negative one,
+    with ties handled by rank averaging. Returns ``nan`` when either side is empty.
+    """
+    if len(genuine) == 0 or len(negatives) == 0:
+        return float("nan")
+    labels = np.concatenate([np.ones(len(genuine)), np.zeros(len(negatives))])
+    scores = np.concatenate([genuine, negatives])
+    return float(roc_auc_score(labels, scores))
+
+
 def _choose_negatives(genuine, skilled, random, mode: str = "auto"):
     """Pick the negative score set used for EER / accuracy.
 
@@ -201,6 +215,7 @@ def _metrics(genuine, skilled, random, threshold, negatives_mode: str = "auto") 
         "accuracy": _accuracy(genuine, negatives, threshold),
         "balanced_accuracy": ((1 - frr) + (1 - far_negative)) / 2,
         "eer": _eer_threshold(genuine, negatives)[1],
+        "auc": _roc_auc(genuine, negatives),
         "far_at_threshold": far_negative,
         # Backwards-compatible skilled / random specific metrics.
         "accuracy_skilled": _accuracy(genuine, skilled, threshold),
@@ -210,6 +225,38 @@ def _metrics(genuine, skilled, random, threshold, negatives_mode: str = "auto") 
         "far_skilled_at_threshold": far_skilled,
         "far_random_at_threshold": far_random,
         "frr_at_threshold": frr,
+        "auc_skilled": _roc_auc(genuine, skilled),
+        "auc_random": _roc_auc(genuine, random),
+    }
+
+
+def reference_metrics(
+    records, embeddings, references: int, negatives_mode: str = "auto"
+) -> dict[str, float]:
+    """EER and AUC under the reference protocol, without selecting a test threshold.
+
+    Scores signers the same way :func:`main` does (leave-``references``-out genuine
+    queries, skilled forgeries, and random cross-signer pairs) so training can pick a
+    checkpoint on the same signer-disjoint metric the evaluation reports. Every signer
+    in ``records`` must have more than ``references`` genuine signatures, and
+    ``embeddings`` must be row-aligned with ``records``.
+    """
+    scores = _scores(records, embeddings, references)
+    signers = sorted(scores)
+    genuine, skilled, random = _pool(scores, signers)
+    negatives = _choose_negatives(genuine, skilled, random, negatives_mode)
+    threshold, eer = _eer_threshold(genuine, negatives)
+    source = negatives_mode
+    if source == "auto":
+        source = "skilled" if len(skilled) else "random"
+    return {
+        "eer": eer,
+        "auc": _roc_auc(genuine, negatives),
+        "eer_threshold": threshold,
+        "genuine_queries": len(genuine),
+        "skilled_forgeries": len(skilled),
+        "random_pairs": len(random),
+        "negatives_source": source,
     }
 
 

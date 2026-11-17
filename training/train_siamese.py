@@ -6,17 +6,21 @@ import argparse
 import json
 import math
 import random
+import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
+from training.evaluate import reference_metrics
 from training.stage3_metric_learning import (
     PKBatchSampler,
     SignatureDataset,
+    SignatureRecord,
     SiameseSignatureModel,
     load_manifest,
     triplet_loss,
@@ -87,6 +91,110 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _reference_selection_records(
+    records: Sequence[SignatureRecord], references: int
+) -> tuple[list[SignatureRecord], list[int]]:
+    """Records (and their indices) for signers with enough genuine samples to enroll.
+
+    The reference protocol scores a query against ``references`` enrolled genuine
+    signatures, so a signer needs strictly more than that many genuine samples. The
+    returned indices let callers align a full-length embedding array to the subset.
+    """
+    genuine_counts: dict[str, int] = defaultdict(int)
+    for record in records:
+        if not record.is_forgery:
+            genuine_counts[record.signer_id] += 1
+    eligible = {signer for signer, count in genuine_counts.items() if count > references}
+    indices = [index for index, record in enumerate(records) if record.signer_id in eligible]
+    return [records[index] for index in indices], indices
+
+
+def _can_score(
+    records: Sequence[SignatureRecord], references: int, negatives_mode: str = "auto"
+) -> bool:
+    """Whether the signers can produce EER/AUC under the reference protocol.
+
+    Random negatives need a second signer; skilled negatives need a forgery. With
+    neither, only genuine scores exist and EER/AUC are undefined.
+    """
+    eligible, _ = _reference_selection_records(records, references)
+    if not eligible:
+        return False
+    signers = {record.signer_id for record in eligible}
+    has_forgery = any(record.is_forgery for record in eligible)
+    if negatives_mode == "skilled":
+        return has_forgery
+    if negatives_mode == "random":
+        return len(signers) >= 2
+    return len(signers) >= 2 or has_forgery
+
+
+@torch.no_grad()
+def _embed_records(
+    model: SiameseSignatureModel,
+    dataset: SignatureDataset,
+    device: torch.device,
+    batch_size: int,
+    workers: int,
+) -> np.ndarray:
+    """Embed a dataset once, in record order, for the reference protocol."""
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
+    was_training = model.training
+    model.eval()
+    chunks = [model(images.to(device)).cpu().numpy() for images, _, _ in loader]
+    model.train(was_training)
+    return np.concatenate(chunks)
+
+
+def _improves(metric: str, candidate: float, best: float) -> bool:
+    """Whether ``candidate`` beats ``best`` under the chosen selection metric."""
+    if math.isnan(candidate):
+        return False
+    if metric == "auc":
+        return candidate > best
+    return candidate < best
+
+
+def _save_checkpoint(
+    path: Path,
+    model: SiameseSignatureModel,
+    *,
+    select_metric: str,
+    select_value: float,
+    selection: dict[str, float],
+    validation_loss: float,
+    epoch: int,
+    phase: str,
+    seed: int,
+    already_preprocessed: bool,
+    ink: str,
+) -> None:
+    """Write the checkpoint dict that consumers reconstruct the model from.
+
+    ``best_validation_loss`` is kept for backwards compatibility; ``select_metric``
+    and ``select_value`` record which epoch was kept and why.
+    """
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "embedding_dim": model.embedding_dim,
+            "best_validation_loss": validation_loss,
+            "select_metric": select_metric,
+            "select_value": select_value,
+            "selection_metrics": selection,
+            "epoch": epoch,
+            "phase": phase,
+            "seed": seed,
+            "preprocessing": {
+                "already_preprocessed": already_preprocessed,
+                "ink": ink,
+                "target_size": list(DEFAULT_TARGET_SIZE),
+            },
+        },
+        path,
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -108,6 +216,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--margin", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--select-metric",
+        choices=("loss", "eer", "auc"),
+        default="eer",
+        help="Checkpoint criterion: lowest validation loss, lowest EER, or highest "
+        "AUC. EER/AUC use the signer-disjoint reference protocol from training.evaluate. "
+        "Average loss is only a proxy that saturates once the margin is met, so EER "
+        "(the reported metric) is the default.",
+    )
+    parser.add_argument(
+        "--select-references",
+        type=int,
+        default=1,
+        help="Genuine signatures enrolled per signer when scoring EER/AUC. A signer "
+        "needs more genuine samples than this to be scored.",
+    )
+    parser.add_argument(
+        "--select-negatives",
+        choices=("auto", "skilled", "random"),
+        default="auto",
+        help="Negative set for EER/AUC: skilled forgeries, cross-signer genuines, or auto.",
+    )
+    parser.add_argument(
+        "--select-batch-size",
+        type=int,
+        default=64,
+        help="Batch size for the per-epoch EER/AUC embedding pass.",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +257,10 @@ def main() -> None:
         raise ValueError("workers cannot be negative")
     if args.margin <= 0:
         raise ValueError("margin must be positive")
+    if args.select_references < 1:
+        raise ValueError("select-references must be at least 1")
+    if args.select_batch_size < 1:
+        raise ValueError("select-batch-size must be at least 1")
 
     _set_seed(args.seed)
     train_records, validation_records = load_manifest(args.manifest, args.image_root)
@@ -175,6 +315,19 @@ def main() -> None:
         seed=args.seed,
     )
 
+    select_metric = args.select_metric
+    if select_metric != "loss" and not _can_score(
+        validation_records, args.select_references, args.select_negatives
+    ):
+        print(
+            f"warning: validation set cannot support '{select_metric}' selection "
+            f"(need two eligible signers or a forgery, each with more than "
+            f"{args.select_references} genuine signatures, for negatives "
+            f"'{args.select_negatives}'); using loss instead",
+            file=sys.stderr,
+        )
+        select_metric = "loss"
+
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
@@ -193,7 +346,10 @@ def main() -> None:
     model = SiameseSignatureModel(pretrained=not args.no_pretrained).to(device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.output_dir / "best_model.pt"
-    best_validation_loss = math.inf
+    # AUC improves as it rises; loss and EER improve as they fall.
+    best_selection_value = -math.inf if select_metric == "auc" else math.inf
+    saved_checkpoint = False
+    print(f"Checkpoint selection metric: {select_metric}")
 
     phases: list[tuple[str, int, float, Literal["semi-hard", "batch-hard"]]] = [
         ("warmup", args.phase1_epochs, 1e-3, "semi-hard"),
@@ -232,38 +388,82 @@ def main() -> None:
                 mining="batch-hard",
                 margin=args.margin,
             )
+
+            # EER/AUC score the validation signers with the same reference protocol
+            # the evaluation reports, so the checkpoint is chosen on the target metric
+            # instead of the average loss, which saturates once the margin is met.
+            selection: dict[str, float] = {"loss": validation_metrics["loss"]}
+            negatives_source: str | None = None
+            if select_metric != "loss":
+                embeddings = _embed_records(
+                    model,
+                    validation_dataset,
+                    device,
+                    args.select_batch_size,
+                    args.workers,
+                )
+                eligible_records, eligible_indices = _reference_selection_records(
+                    validation_records, args.select_references
+                )
+                reference = reference_metrics(
+                    eligible_records,
+                    embeddings[eligible_indices],
+                    args.select_references,
+                    args.select_negatives,
+                )
+                selection["eer"] = reference["eer"]
+                selection["auc"] = reference["auc"]
+                selection["eer_threshold"] = reference["eer_threshold"]
+                negatives_source = reference["negatives_source"]
+            candidate = selection["loss"] if select_metric == "loss" else selection[select_metric]
+
             global_epoch += 1
-            print(
-                json.dumps(
-                    {
-                        "phase": phase_name,
-                        "epoch": phase_epoch + 1,
-                        "train": train_metrics,
-                        "validation": validation_metrics,
-                    }
-                )
-            )
+            epoch_record: dict[str, object] = {
+                "phase": phase_name,
+                "epoch": phase_epoch + 1,
+                "train": train_metrics,
+                "validation": validation_metrics,
+                "selection": selection,
+            }
+            if negatives_source is not None:
+                epoch_record["selection_negatives"] = negatives_source
+            print(json.dumps(epoch_record))
 
-            if validation_metrics["loss"] < best_validation_loss:
-                best_validation_loss = validation_metrics["loss"]
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "embedding_dim": model.embedding_dim,
-                        "best_validation_loss": best_validation_loss,
-                        "epoch": global_epoch,
-                        "phase": phase_name,
-                        "seed": args.seed,
-                        "preprocessing": {
-                            "already_preprocessed": args.already_preprocessed,
-                            "ink": args.ink,
-                            "target_size": list(DEFAULT_TARGET_SIZE),
-                        },
-                    },
+            if _improves(select_metric, candidate, best_selection_value):
+                best_selection_value = candidate
+                saved_checkpoint = True
+                _save_checkpoint(
                     checkpoint_path,
+                    model,
+                    select_metric=select_metric,
+                    select_value=best_selection_value,
+                    selection=selection,
+                    validation_loss=validation_metrics["loss"],
+                    epoch=global_epoch,
+                    phase=phase_name,
+                    seed=args.seed,
+                    already_preprocessed=args.already_preprocessed,
+                    ink=args.ink,
                 )
 
-    print(f"Best checkpoint: {checkpoint_path}")
+    if not saved_checkpoint:
+        # A metric that was undefined or never improved should not leave the output
+        # directory without a checkpoint that downstream tools can load.
+        _save_checkpoint(
+            checkpoint_path,
+            model,
+            select_metric=select_metric,
+            select_value=candidate,
+            selection=selection,
+            validation_loss=validation_metrics["loss"],
+            epoch=global_epoch,
+            phase=phase_name,
+            seed=args.seed,
+            already_preprocessed=args.already_preprocessed,
+            ink=args.ink,
+        )
+
+    print(f"Best checkpoint: {checkpoint_path} ({select_metric}={candidate})")
 
 
 if __name__ == "__main__":

@@ -64,9 +64,13 @@ Defaults follow the plan: 5 frozen-backbone warm-up epochs with semi-hard
 mining, then 20 epochs with the final two backbone stages unfrozen and
 batch-hard mining. The default batch uses 12 signers, 4 genuine samples per
 signer, and up to 2 skilled forgeries per signer. Adjust batch size and epoch
-counts for available data and hardware. Checkpoints are selected by
-signer-disjoint validation loss (always computed with batch-hard mining so
-warm-up and fine-tune losses are comparable) and written to `checkpoints/stage3/best_model.pt`.
+counts for available data and hardware. Checkpoints are selected on a
+signer-disjoint validation metric — EER by default (`--select-metric eer`; also
+`loss` or `auc`), scored with the same reference protocol `training.evaluate`
+reports — and written to `checkpoints/stage3/best_model.pt`. The `loss` option
+reproduces the earlier criterion (batch-hard mining in both phases so values stay
+comparable); EER is the reported verification metric, and average triplet loss
+saturates once the margin is met, so it is a weaker selection signal.
 
 Run the focused checks with:
 
